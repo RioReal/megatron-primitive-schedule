@@ -72,6 +72,23 @@ def test_get_forward_backward_func():
     Utils.destroy_model_parallel()
 
 
+def test_get_forward_backward_func_primitive_schedule():
+    forward_backward_func = schedule.get_forward_backward_func(
+        pp_size=2,
+        vp_size=2,
+        pipeline_schedule="primitive",
+        primitive_schedule_trace_iteration=3,
+    )
+    assert forward_backward_func.func == schedule.forward_backward_primitive_schedule
+    assert forward_backward_func.keywords["primitive_schedule_trace_iteration"] == 3
+
+    with pytest.raises(ValueError, match="pipeline parallelism"):
+        schedule.get_forward_backward_func(pp_size=1, vp_size=2, pipeline_schedule="primitive")
+
+    with pytest.raises(ValueError, match="virtual pipeline parallelism"):
+        schedule.get_forward_backward_func(pp_size=2, vp_size=None, pipeline_schedule="primitive")
+
+
 def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)

@@ -50,6 +50,17 @@ def get_transformer_layer_offset(
     if pp_rank is None:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
+    if config.virtual_pipeline_layer_partition is not None:
+        assert vp_stage is not None, "vp_stage must be provided for virtual pipeline partition"
+        return sum(
+            config.virtual_pipeline_layer_partition[p][v]
+            for v in range(vp_stage)
+            for p in range(config.pipeline_model_parallel_size)
+        ) + sum(config.virtual_pipeline_layer_partition[p][vp_stage] for p in range(pp_rank))
+
+    if config.pipeline_layer_partition is not None:
+        return sum(config.pipeline_layer_partition[:pp_rank])
+
     is_first_pp_stage = pp_rank == 0
 
     if config.pipeline_model_parallel_size > 1:

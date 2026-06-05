@@ -219,7 +219,11 @@ class GPTModelConfig(ModelConfig):
         is_pipeline_asymmetric |= (
             self.transformer.num_layers_in_first_pipeline_stage or self.transformer.num_layers_in_last_pipeline_stage
         ) is not None
-        is_flexible_pp_layout = is_pipeline_asymmetric or (self.transformer.pipeline_model_parallel_layout is not None)
+        is_flexible_pp_layout = (
+            is_pipeline_asymmetric
+            or (self.transformer.pipeline_model_parallel_layout is not None)
+            or (self.transformer.virtual_pipeline_layer_partition is not None)
+        )
         if vp_size and not is_flexible_pp_layout:
             p_size = self.transformer.pipeline_model_parallel_size
             assert (self.transformer.num_layers // p_size) % vp_size == 0, (

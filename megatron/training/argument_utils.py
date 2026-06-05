@@ -304,6 +304,14 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['pipeline_layer_partition'] = getattr(
+        args, 'pipeline_layer_partition_list', getattr(args, 'pipeline_layer_partition', None)
+    )
+    kw_args['virtual_pipeline_layer_partition'] = getattr(
+        args,
+        'virtual_pipeline_layer_partition_list',
+        getattr(args, 'virtual_pipeline_layer_partition', None),
+    )
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
     if args.swiglu:

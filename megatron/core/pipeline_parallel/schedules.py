@@ -1,6 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import json
+import os
+import time
+import warnings
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -39,13 +43,23 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
+from .custom_schedule import generate_custom_pipeline_schedule
 from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
 
+_PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT = 0
 
-def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
+
+def get_forward_backward_func(
+    pp_size: Optional[int] = None,
+    vp_size: Optional[int] = None,
+    pipeline_schedule: Optional[str] = None,
+    primitive_schedule_debug: bool = False,
+    primitive_schedule_trace_dir: Optional[str] = None,
+    primitive_schedule_trace_iteration: Optional[int] = None,
+):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
 
@@ -144,6 +158,18 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
+    if pipeline_schedule == "primitive":
+        if pp_size <= 1:
+            raise ValueError("--pipeline-schedule primitive requires pipeline parallelism")
+        if vp_size is None:
+            raise ValueError("--pipeline-schedule primitive requires virtual pipeline parallelism")
+        return partial(
+            forward_backward_primitive_schedule,
+            primitive_schedule_debug=primitive_schedule_debug,
+            primitive_schedule_trace_dir=primitive_schedule_trace_dir,
+            primitive_schedule_trace_iteration=primitive_schedule_trace_iteration,
+        )
+
     if pp_size > 1:
         if vp_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
@@ -152,6 +178,375 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
     else:
         forward_backward_func = forward_backward_no_pipelining
     return forward_backward_func
+
+
+def forward_backward_primitive_schedule(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: Optional[int] = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,  # unused
+    force_all_reduce: Optional[bool] = False,  # unused
+    primitive_schedule_debug: bool = False,
+    primitive_schedule_trace_dir: Optional[str] = None,
+    primitive_schedule_trace_iteration: Optional[int] = None,
+):
+    """Run the primitive table-driven pipeline schedule."""
+    global _PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT
+
+    if not isinstance(model, list):
+        raise ValueError("--pipeline-schedule primitive requires interleaved model chunks")
+    if not isinstance(data_iterator, list):
+        raise ValueError("--pipeline-schedule primitive requires per-chunk data iterators")
+    if decoder_seq_length is not None:
+        raise ValueError(
+            "--pipeline-schedule primitive does not support encoder-decoder models yet"
+        )
+    if adjust_tensor_shapes_fn is not None:
+        raise ValueError(
+            "--pipeline-schedule primitive does not support adjusted tensor shapes yet"
+        )
+
+    config = get_model_config(model[0])
+    if config.overlap_p2p_comm:
+        raise ValueError("--pipeline-schedule primitive does not support overlapping p2p yet")
+    if config.pipeline_model_parallel_size <= 1:
+        raise ValueError("--pipeline-schedule primitive requires pipeline parallelism")
+    if config.virtual_pipeline_model_parallel_size is None:
+        raise ValueError("--pipeline-schedule primitive requires virtual pipeline parallelism")
+    if config.virtual_pipeline_layer_partition is None:
+        raise ValueError(
+            "--pipeline-schedule primitive requires --virtual-pipeline-layer-partition"
+        )
+    if len(model) != config.virtual_pipeline_model_parallel_size:
+        raise ValueError("--pipeline-schedule primitive expected one model chunk per VP rank")
+    if len(data_iterator) != len(model):
+        raise ValueError("--pipeline-schedule primitive expected one data iterator per model chunk")
+
+    if p2p_communicator is None and pg_collection is None:
+        p2p_communicator = P2PCommunicator(
+            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+        )
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        cp_size = cp_group.size()
+        embd_group = parallel_state.get_embedding_group(check_initialized=False)
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
+
+        pg_collection = ProcessGroupCollection()
+        pg_collection.tp = tp_group
+        pg_collection.cp = cp_group
+        pg_collection.embd = embd_group
+        pg_collection.pos_embd = pos_emb_group
+        pg_collection.pp = pp_group
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False
+        )
+        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
+    elif p2p_communicator is not None and pg_collection is not None:
+        if isinstance(p2p_communicator, MultiModulePipelineCommunicator) or isinstance(
+            pg_collection, MultiModuleProcessGroupCollection
+        ):
+            raise ValueError("--pipeline-schedule primitive does not support multimodule pipelines")
+        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
+        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
+        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp"
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
+        cp_size = cp_group.size()
+        pp_group = p2p_communicator.pp_group
+    else:
+        raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
+
+    partition = config.virtual_pipeline_layer_partition
+    pp_size = config.pipeline_model_parallel_size
+    vp_size = config.virtual_pipeline_model_parallel_size
+    stage_layer_counts = [
+        partition[pp_rank][vp_rank]
+        for vp_rank in range(vp_size)
+        for pp_rank in range(pp_size)
+    ]
+
+    primitive_schedule = generate_custom_pipeline_schedule(
+        num_microbatches=num_microbatches,
+        num_logical_stages=pp_size * vp_size,
+        num_physical_workers=pp_size,
+        stage_layer_counts=stage_layer_counts,
+        forward_only=forward_only,
+    )
+
+    if p2p_communicator is not None:
+        pp_rank = p2p_communicator.pp_group.rank()
+    else:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    global_rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else 0
+    )
+    primitive_iteration = None
+    if not forward_only:
+        primitive_iteration = _PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT
+        _PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT += 1
+
+    def trace(task, phase):
+        if primitive_schedule_debug:
+            op_type = "F" if task.is_forward else "B"
+            print(
+                "[primitive-schedule] "
+                f"global_rank={global_rank} current_pp_rank={pp_rank} "
+                f"phase={phase} microbatch_id={task.microbatch_id} op={op_type} "
+                f"logical_stage={task.logical_stage_idx} pp_rank={task.pp_rank} "
+                f"vp_rank={task.vp_rank} start_time={task.start_time} "
+                f"end_time={task.end_time}",
+                flush=True,
+            )
+
+    def set_vp_rank(vp_rank):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            parallel_state.set_virtual_pipeline_model_parallel_rank(vp_rank)
+
+    trace_file = None
+    trace_enabled = (
+        primitive_schedule_trace_dir is not None
+        and primitive_schedule_trace_iteration is not None
+        and primitive_iteration == primitive_schedule_trace_iteration
+    )
+
+    def cuda_synchronize_if_initialized():
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+
+    @contextlib.contextmanager
+    def trace_region(task, phase):
+        if trace_file is None:
+            yield
+            return
+
+        cuda_synchronize_if_initialized()
+        t_start = time.perf_counter()
+        try:
+            yield
+        finally:
+            cuda_synchronize_if_initialized()
+            t_end = time.perf_counter()
+            event = {
+                "primitive_iteration": primitive_iteration,
+                "rank": global_rank,
+                "pp_rank": task.pp_rank,
+                "vp_rank": task.vp_rank,
+                "microbatch": task.microbatch_id,
+                "logical_stage": task.logical_stage_idx,
+                "op_index": task.op_index,
+                "op_type": "forward" if task.is_forward else "backward",
+                "phase": phase,
+                "predicted_start_time": task.start_time,
+                "predicted_end_time": task.end_time,
+                "t_start": t_start,
+                "t_end": t_end,
+            }
+            trace_file.write(json.dumps(event) + "\n")
+            trace_file.flush()
+
+    no_sync_func = config.no_sync_func
+    if isinstance(no_sync_func, list):
+
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for model_chunk_no_sync_func in config.no_sync_func:
+                stack.enter_context(model_chunk_no_sync_func())
+            return stack
+
+        no_sync_func = multi_no_sync
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+
+    def disable_grad_sync():
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
+
+    if config.finalize_model_grads_func is not None and not forward_only:
+        embedding_module = clear_embedding_activation_buffer(
+            config, model, is_pp_last_stage(p2p_communicator.pp_group)
+        )
+    else:
+        embedding_module = None
+
+    tensor_shapes = get_tensor_shapes(
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        tp_group=tp_group,
+        cp_group=cp_group,
+    )
+    if len(tensor_shapes) != 1:
+        raise ValueError("--pipeline-schedule primitive supports exactly one tensor shape")
+    tensor_shape = tensor_shapes[0]
+
+    forward_data_store = []
+    saved_tensors = {}
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    local_tasks = primitive_schedule.per_rank_tasks[pp_rank]
+
+    if trace_enabled:
+        os.makedirs(primitive_schedule_trace_dir, exist_ok=True)
+        trace_path = os.path.join(
+            primitive_schedule_trace_dir,
+            f"rank_{global_rank}_iter_{primitive_schedule_trace_iteration}.jsonl",
+        )
+        trace_file = open(trace_path, "w", encoding="utf-8")
+
+    should_disable_grad_sync = not forward_only and (
+        config.finalize_model_grads_func is not None or config.grad_sync_func is not None
+    )
+    if should_disable_grad_sync:
+        disable_grad_sync()
+    try:
+        for task in local_tasks:
+            set_vp_rank(task.vp_rank)
+            key = (task.microbatch_id, task.logical_stage_idx)
+
+            if task.is_forward:
+                trace(task, "before_recv_forward")
+                with trace_region(task, "forward_recv"):
+                    input_tensor = p2p_communicator.recv_forward(
+                        tensor_shape, is_first_stage=(task.logical_stage_idx == 0)
+                    )
+                trace(task, "after_recv_forward")
+
+                trace(task, "before_forward_compute")
+                with trace_region(task, "forward_compute"):
+                    output_tensor, num_tokens = forward_step(
+                        forward_step_func,
+                        data_iterator[task.vp_rank],
+                        model[task.vp_rank],
+                        num_microbatches,
+                        input_tensor,
+                        forward_data_store,
+                        config,
+                        cp_group_size=cp_size,
+                        collect_non_loss_data=collect_non_loss_data,
+                        checkpoint_activations_microbatch=None,
+                        is_first_microbatch=check_first_val_step(
+                            first_val_step, forward_only, task.microbatch_id == 0
+                        ),
+                        current_microbatch=task.microbatch_id,
+                        vp_stage=task.vp_rank,
+                        is_last_stage=(task.logical_stage_idx == pp_size * vp_size - 1),
+                    )
+                total_num_tokens += num_tokens
+                trace(task, "after_forward_compute")
+
+                trace(task, "before_send_forward")
+                with trace_region(task, "forward_send"):
+                    p2p_communicator.send_forward(
+                        output_tensor,
+                        is_last_stage=(task.logical_stage_idx == pp_size * vp_size - 1),
+                    )
+                trace(task, "after_send_forward")
+
+                if not forward_only:
+                    saved_tensors[key] = (input_tensor, output_tensor)
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+            else:
+                if forward_only:
+                    raise RuntimeError("primitive forward-only schedule generated a backward task")
+                if key not in saved_tensors:
+                    raise RuntimeError(
+                        "primitive schedule tried to backward before local forward "
+                        f"({key=})"
+                    )
+                input_tensor, output_tensor = saved_tensors.pop(key)
+
+                trace(task, "before_recv_backward")
+                with trace_region(task, "backward_recv"):
+                    output_tensor_grad = p2p_communicator.recv_backward(
+                        tensor_shape,
+                        is_last_stage=(task.logical_stage_idx == pp_size * vp_size - 1),
+                    )
+                trace(task, "after_recv_backward")
+
+                trace(task, "before_backward_compute")
+                with trace_region(task, "backward_compute"):
+                    input_tensor_grad = backward_step(
+                        input_tensor, output_tensor, output_tensor_grad, config
+                    )
+                trace(task, "after_backward_compute")
+
+                trace(task, "before_send_backward")
+                with trace_region(task, "backward_send"):
+                    p2p_communicator.send_backward(
+                        input_tensor_grad, is_first_stage=(task.logical_stage_idx == 0)
+                    )
+                trace(task, "after_send_backward")
+
+        enable_grad_sync()
+        if config.grad_sync_func is not None and not forward_only:
+            grad_sync_funcs = config.grad_sync_func
+            if not isinstance(grad_sync_funcs, list):
+                grad_sync_funcs = [grad_sync_funcs for _ in model]
+            for model_chunk, grad_sync_func in zip(model, grad_sync_funcs):
+                grad_sync_func(model_chunk.parameters())
+
+        if not forward_only and saved_tensors:
+            raise RuntimeError(
+                f"primitive schedule left saved tensors unconsumed: {saved_tensors.keys()}"
+            )
+
+        if config.finalize_model_grads_func is not None and not forward_only:
+            finish_embedding_wgrad_compute(
+                config, embedding_module, is_pp_last_stage(p2p_communicator.pp_group), tp_group
+            )
+            config.finalize_model_grads_func(
+                model,
+                total_num_tokens if config.calculate_per_token_loss else None,
+                pg_collection=pg_collection,
+                force_all_reduce=force_all_reduce,
+            )
+    finally:
+        enable_grad_sync()
+        set_vp_rank(None)
+        if getattr(config, 'fine_grained_activation_offloading', False):
+            off_interface.reset()
+        if config.timers is not None:
+            config.timers('forward-backward').stop()
+        if trace_file is not None:
+            trace_file.close()
+
+    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
+        create_cudagraphs()
+
+    return forward_data_store
 
 
 def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):

@@ -121,6 +121,14 @@ class TransformerConfig(ModelParallelConfig):
         vpp rank 1 pp rank 0~2 holds: decoder
         vpp rank 1 pp rank 3 holds: mtp, loss"""
 
+    pipeline_layer_partition: Optional[List[int]] = None
+    """Number of decoder transformer layers to build on each physical pipeline rank.
+    This prototype only supports non-virtual pipeline parallelism."""
+
+    virtual_pipeline_layer_partition: Optional[List[List[int]]] = None
+    """Number of decoder transformer layers to build on each physical pipeline rank and
+    virtual pipeline chunk."""
+
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
@@ -1707,6 +1715,122 @@ class TransformerConfig(ModelParallelConfig):
                 "set at the same time with account_for_embedding_in_pipeline_split"
                 "and account_for_loss_in_pipeline_split"
             )
+
+        if self.virtual_pipeline_layer_partition is not None:
+            if self.pipeline_layer_partition is not None:
+                raise ValueError(
+                    "virtual_pipeline_layer_partition cannot be set with pipeline_layer_partition"
+                )
+            if self.pipeline_model_parallel_layout is not None:
+                raise ValueError(
+                    "virtual_pipeline_layer_partition cannot be set with "
+                    "pipeline_model_parallel_layout"
+                )
+            if (
+                self.num_layers_in_first_pipeline_stage is not None
+                or self.num_layers_in_last_pipeline_stage is not None
+            ):
+                raise ValueError(
+                    "virtual_pipeline_layer_partition cannot be set with "
+                    "num_layers_in_first_pipeline_stage or num_layers_in_last_pipeline_stage"
+                )
+            if (
+                self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            ):
+                raise ValueError(
+                    "virtual_pipeline_layer_partition cannot be set with "
+                    "account_for_embedding_in_pipeline_split or "
+                    "account_for_loss_in_pipeline_split"
+                )
+            if len(self.virtual_pipeline_layer_partition) != self.pipeline_model_parallel_size:
+                raise ValueError(
+                    "virtual_pipeline_layer_partition row count must match "
+                    "pipeline_model_parallel_size "
+                    f"({len(self.virtual_pipeline_layer_partition)=}, "
+                    f"{self.pipeline_model_parallel_size=})"
+                )
+            if any(len(row) == 0 for row in self.virtual_pipeline_layer_partition):
+                raise ValueError("virtual_pipeline_layer_partition rows must not be empty")
+            virtual_pipeline_model_parallel_size = len(self.virtual_pipeline_layer_partition[0])
+            if virtual_pipeline_model_parallel_size <= 1:
+                raise ValueError(
+                    "virtual_pipeline_layer_partition must specify more than one virtual chunk"
+                )
+            if any(
+                len(row) != virtual_pipeline_model_parallel_size
+                for row in self.virtual_pipeline_layer_partition
+            ):
+                raise ValueError("virtual_pipeline_layer_partition rows must have equal length")
+            if self.virtual_pipeline_model_parallel_size is None:
+                self.virtual_pipeline_model_parallel_size = virtual_pipeline_model_parallel_size
+            elif self.virtual_pipeline_model_parallel_size != virtual_pipeline_model_parallel_size:
+                raise ValueError(
+                    "virtual_pipeline_layer_partition column count must match "
+                    "virtual_pipeline_model_parallel_size "
+                    f"({virtual_pipeline_model_parallel_size=}, "
+                    f"{self.virtual_pipeline_model_parallel_size=})"
+                )
+            if any(
+                not isinstance(layer_count, int) or layer_count <= 0
+                for row in self.virtual_pipeline_layer_partition
+                for layer_count in row
+            ):
+                raise ValueError(
+                    "virtual_pipeline_layer_partition entries must all be positive integers "
+                    f"({self.virtual_pipeline_layer_partition=})"
+                )
+            if sum(sum(row) for row in self.virtual_pipeline_layer_partition) != self.num_layers:
+                raise ValueError(
+                    "virtual_pipeline_layer_partition sum must match num_layers "
+                    f"({sum(sum(row) for row in self.virtual_pipeline_layer_partition)=}, "
+                    f"{self.num_layers=})"
+                )
+
+        if self.pipeline_layer_partition is not None:
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    "pipeline_layer_partition does not support virtual pipeline parallelism"
+                )
+            if self.pipeline_model_parallel_layout is not None:
+                raise ValueError(
+                    "pipeline_layer_partition cannot be set with pipeline_model_parallel_layout"
+                )
+            if (
+                self.num_layers_in_first_pipeline_stage is not None
+                or self.num_layers_in_last_pipeline_stage is not None
+            ):
+                raise ValueError(
+                    "pipeline_layer_partition cannot be set with "
+                    "num_layers_in_first_pipeline_stage or num_layers_in_last_pipeline_stage"
+                )
+            if (
+                self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            ):
+                raise ValueError(
+                    "pipeline_layer_partition cannot be set with "
+                    "account_for_embedding_in_pipeline_split or account_for_loss_in_pipeline_split"
+                )
+            if len(self.pipeline_layer_partition) != self.pipeline_model_parallel_size:
+                raise ValueError(
+                    "pipeline_layer_partition length must match pipeline_model_parallel_size "
+                    f"({len(self.pipeline_layer_partition)=}, "
+                    f"{self.pipeline_model_parallel_size=})"
+                )
+            if any(
+                not isinstance(layer_count, int) or layer_count <= 0
+                for layer_count in self.pipeline_layer_partition
+            ):
+                raise ValueError(
+                    "pipeline_layer_partition entries must all be positive integers "
+                    f"({self.pipeline_layer_partition=})"
+                )
+            if sum(self.pipeline_layer_partition) != self.num_layers:
+                raise ValueError(
+                    "pipeline_layer_partition sum must match num_layers "
+                    f"({sum(self.pipeline_layer_partition)=}, {self.num_layers=})"
+                )
 
         # PP layout
         if self.pipeline_model_parallel_layout is not None:

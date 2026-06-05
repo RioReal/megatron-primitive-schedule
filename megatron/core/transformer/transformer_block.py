@@ -90,6 +90,13 @@ def get_num_layers_to_build(
     if pp_rank is None:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
+    if config.virtual_pipeline_layer_partition is not None:
+        assert vp_stage is not None, "vp_stage must be provided for virtual pipeline partition"
+        return config.virtual_pipeline_layer_partition[pp_rank][vp_stage]
+
+    if config.pipeline_layer_partition is not None:
+        return config.pipeline_layer_partition[pp_rank]
+
     is_first_pp_stage = pp_rank == 0
     is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
 
@@ -365,6 +372,25 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+        if (
+            self.config.pipeline_layer_partition is not None
+            or self.config.virtual_pipeline_layer_partition is not None
+        ):
+            pp_rank = get_pg_rank(self.pg_collection.pp)
+            layer_offset = get_transformer_layer_offset(self.config, self.vp_stage, pp_rank)
+            local_num_layers = len(self.layers)
+            global_layers = list(range(layer_offset + 1, layer_offset + local_num_layers + 1))
+            global_rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            print(
+                f"[pipeline-layer-partition] global_rank={global_rank} pp_rank={pp_rank} "
+                f"local_num_layers={local_num_layers} layer_offset={layer_offset} "
+                f"global_layers={global_layers}",
+                flush=True,
+            )
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline

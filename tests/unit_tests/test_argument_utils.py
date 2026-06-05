@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import signal
+import sys
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Union
@@ -13,7 +14,14 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    core_transformer_config_from_args,
     pretrain_cfg_container_from_args,
+)
+from megatron.training.arguments import (
+    pipeline_layer_partition_type,
+    parse_args,
+    validate_args,
+    virtual_pipeline_layer_partition_type,
 )
 from megatron.training.config import PretrainConfigContainer
 
@@ -81,6 +89,205 @@ class ConfigWithLiteral:
 
     precision: Literal[16, 32] = 32
     """Precision level"""
+
+
+def test_pipeline_layer_partition_type():
+    assert pipeline_layer_partition_type("4,6,5,9") == [4, 6, 5, 9]
+    assert pipeline_layer_partition_type("4, 6, 5, 9") == [4, 6, 5, 9]
+
+    with pytest.raises(ValueError, match="comma-separated list of integers"):
+        pipeline_layer_partition_type("4,,5")
+
+
+def test_virtual_pipeline_layer_partition_type():
+    assert virtual_pipeline_layer_partition_type("2,2;3,3;2,3;5,4") == [
+        [2, 2],
+        [3, 3],
+        [2, 3],
+        [5, 4],
+    ]
+
+
+@pytest.mark.parametrize("partition", ["2,2;3", "2,x", "2,0", "2,-1"])
+def test_virtual_pipeline_layer_partition_type_rejects_invalid_input(partition):
+    with pytest.raises(ValueError):
+        virtual_pipeline_layer_partition_type(partition)
+
+
+def test_core_transformer_config_from_args_without_pipeline_layer_partition_attrs():
+    args = Namespace(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        no_persist_layer_norm=False,
+        params_dtype=None,
+        overlap_p2p_comm=False,
+        num_experts=None,
+        rotary_interleaved=False,
+        decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None,
+        fp8_param_gather=False,
+        fp4_param_gather=False,
+        swiglu=False,
+        bias_swiglu_fusion=False,
+        bias_gelu_fusion=False,
+        squared_relu=False,
+        quick_geglu=False,
+        init_method_xavier_uniform=False,
+        group_query_attention=False,
+        num_query_groups=None,
+        config_logger_dir='',
+        rope_type=None,
+        multi_latent_attention=False,
+        heterogeneous_layers_config_path=None,
+        cp_comm_type=['p2p'],
+        hybrid_layer_pattern=None,
+        seed=123,
+        moe_latent_size=None,
+        te_precision_config_file=None,
+    )
+
+    config = core_transformer_config_from_args(args)
+
+    assert config.pipeline_layer_partition is None
+    assert config.virtual_pipeline_layer_partition is None
+
+
+def test_virtual_pipeline_layer_partition_allows_num_layers_per_virtual_stage(monkeypatch):
+    monkeypatch.setenv('RANK', '0')
+    monkeypatch.setenv('WORLD_SIZE', '2')
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'test_argument_utils.py',
+            '--tensor-model-parallel-size',
+            '1',
+            '--pipeline-model-parallel-size',
+            '2',
+            '--num-layers',
+            '8',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '4',
+            '--seq-length',
+            '128',
+            '--max-position-embeddings',
+            '128',
+            '--micro-batch-size',
+            '2',
+            '--global-batch-size',
+            '8',
+            '--train-iters',
+            '10',
+            '--num-layers-per-virtual-pipeline-stage',
+            '2',
+            '--virtual-pipeline-layer-partition',
+            '1,3;2,2',
+        ],
+    )
+
+    args = validate_args(parse_args())
+
+    assert args.virtual_pipeline_layer_partition_list == [[1, 3], [2, 2]]
+    assert args.virtual_pipeline_model_parallel_size == 2
+
+
+def test_primitive_schedule_allows_pp2_without_p2p_overlap(monkeypatch):
+    monkeypatch.setenv('RANK', '0')
+    monkeypatch.setenv('WORLD_SIZE', '2')
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'test_argument_utils.py',
+            '--tensor-model-parallel-size',
+            '1',
+            '--pipeline-model-parallel-size',
+            '2',
+            '--num-layers',
+            '24',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '4',
+            '--seq-length',
+            '128',
+            '--max-position-embeddings',
+            '128',
+            '--micro-batch-size',
+            '2',
+            '--global-batch-size',
+            '8',
+            '--train-iters',
+            '10',
+            '--num-layers-per-virtual-pipeline-stage',
+            '6',
+            '--virtual-pipeline-layer-partition',
+            '8,8;4,4',
+            '--pipeline-schedule',
+            'primitive',
+            '--no-overlap-p2p-communication',
+            '--primitive-schedule-trace-dir',
+            '/tmp/primitive-trace',
+            '--primitive-schedule-trace-iteration',
+            '0',
+        ],
+    )
+
+    args = validate_args(parse_args())
+
+    assert args.pipeline_schedule == 'primitive'
+    assert args.pipeline_model_parallel_size == 2
+    assert args.overlap_p2p_comm is False
+    assert args.virtual_pipeline_model_parallel_size == 2
+    assert args.primitive_schedule_trace_dir == '/tmp/primitive-trace'
+    assert args.primitive_schedule_trace_iteration == 0
+
+
+def test_primitive_schedule_trace_dir_requires_iteration(monkeypatch):
+    monkeypatch.setenv('RANK', '0')
+    monkeypatch.setenv('WORLD_SIZE', '2')
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'test_argument_utils.py',
+            '--tensor-model-parallel-size',
+            '1',
+            '--pipeline-model-parallel-size',
+            '2',
+            '--num-layers',
+            '24',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '4',
+            '--seq-length',
+            '128',
+            '--max-position-embeddings',
+            '128',
+            '--micro-batch-size',
+            '2',
+            '--global-batch-size',
+            '8',
+            '--train-iters',
+            '10',
+            '--num-layers-per-virtual-pipeline-stage',
+            '6',
+            '--virtual-pipeline-layer-partition',
+            '8,8;4,4',
+            '--pipeline-schedule',
+            'primitive',
+            '--no-overlap-p2p-communication',
+            '--primitive-schedule-trace-dir',
+            '/tmp/primitive-trace',
+        ],
+    )
+
+    with pytest.raises(ValueError, match='trace-iteration'):
+        validate_args(parse_args())
 
 
 class TestArgumentGroupFactoryBasic:

@@ -396,6 +396,58 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def pipeline_layer_partition_type(x):
+    """
+    Convert a comma-separated pipeline layer partition to a list of integers.
+    Example: "4,6,5,9" -> [4, 6, 5, 9]
+    """
+    if x is None or isinstance(x, list):
+        return x
+    assert isinstance(x, str)
+    try:
+        partition = [int(i.strip()) for i in x.split(',')]
+    except ValueError as exc:
+        raise ValueError(
+            f"--pipeline-layer-partition must be a comma-separated list of integers, got {x}"
+        ) from exc
+    if any(i == '' for i in x.split(',')):
+        raise ValueError(
+            f"--pipeline-layer-partition must be a comma-separated list of integers, got {x}"
+        )
+    return partition
+
+
+def virtual_pipeline_layer_partition_type(x):
+    """
+    Convert a semicolon/comma-separated virtual pipeline layer partition to a matrix.
+    Example: "2,2;3,3" -> [[2, 2], [3, 3]]
+    """
+    if x is None or isinstance(x, list):
+        return x
+    assert isinstance(x, str)
+    try:
+        partition = [[int(i.strip()) for i in row.split(',')] for row in x.split(';')]
+    except ValueError as exc:
+        raise ValueError(
+            f"--virtual-pipeline-layer-partition must be a semicolon-separated "
+            f"matrix of comma-separated integers, got {x}"
+        ) from exc
+    if any(i == '' for row in x.split(';') for i in row.split(',')):
+        raise ValueError(
+            f"--virtual-pipeline-layer-partition must be a semicolon-separated "
+            f"matrix of comma-separated integers, got {x}"
+        )
+    if len(partition) == 0 or any(len(row) == 0 for row in partition):
+        raise ValueError("--virtual-pipeline-layer-partition rows must not be empty")
+    if any(len(row) != len(partition[0]) for row in partition):
+        raise ValueError("--virtual-pipeline-layer-partition rows must have equal length")
+    if any(i <= 0 for row in partition for i in row):
+        raise ValueError(
+            "--virtual-pipeline-layer-partition entries must all be positive integers"
+        )
+    return partition
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -903,6 +955,205 @@ def validate_args(args, defaults={}):
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
+    args.pipeline_layer_partition_list = getattr(args, 'pipeline_layer_partition', None)
+    if args.pipeline_layer_partition_list is not None:
+        pipeline_model_parallel_layout = getattr(args, 'pipeline_model_parallel_layout', None)
+        first_pipeline_num_layers = getattr(args, 'num_layers_in_first_pipeline_stage', None)
+        decoder_first_pipeline_num_layers = getattr(
+            args, 'decoder_first_pipeline_num_layers', None
+        )
+        last_pipeline_num_layers = getattr(args, 'num_layers_in_last_pipeline_stage', None)
+        decoder_last_pipeline_num_layers = getattr(args, 'decoder_last_pipeline_num_layers', None)
+        account_for_embedding_in_pipeline_split = getattr(
+            args, 'account_for_embedding_in_pipeline_split', False
+        )
+        account_for_loss_in_pipeline_split = getattr(
+            args, 'account_for_loss_in_pipeline_split', False
+        )
+        num_layers_per_virtual_pipeline_stage = getattr(
+            args, 'num_layers_per_virtual_pipeline_stage', None
+        )
+        num_virtual_stages_per_pipeline_rank = getattr(
+            args, 'num_virtual_stages_per_pipeline_rank', None
+        )
+        virtual_pipeline_model_parallel_size = getattr(
+            args, 'virtual_pipeline_model_parallel_size', None
+        )
+        pipeline_model_parallel_size = getattr(args, 'pipeline_model_parallel_size', None)
+        num_layers = getattr(args, 'num_layers', None)
+
+        if pipeline_model_parallel_layout is not None:
+            raise ValueError(
+                '--pipeline-layer-partition cannot be used with --pipeline-model-parallel-layout.'
+            )
+        if first_pipeline_num_layers is not None or decoder_first_pipeline_num_layers is not None:
+            raise ValueError(
+                '--pipeline-layer-partition cannot be used with '
+                '--decoder-first-pipeline-num-layers.'
+            )
+        if last_pipeline_num_layers is not None or decoder_last_pipeline_num_layers is not None:
+            raise ValueError(
+                '--pipeline-layer-partition cannot be used with '
+                '--decoder-last-pipeline-num-layers.'
+            )
+        if account_for_embedding_in_pipeline_split:
+            raise ValueError(
+                '--pipeline-layer-partition cannot be used with '
+                '--account-for-embedding-in-pipeline-split.'
+            )
+        if account_for_loss_in_pipeline_split:
+            raise ValueError(
+                '--pipeline-layer-partition cannot be used with '
+                '--account-for-loss-in-pipeline-split.'
+            )
+        if (
+            num_layers_per_virtual_pipeline_stage is not None
+            or num_virtual_stages_per_pipeline_rank is not None
+            or virtual_pipeline_model_parallel_size is not None
+        ):
+            raise ValueError(
+                '--pipeline-layer-partition only supports non-virtual pipeline parallelism.'
+            )
+        if len(args.pipeline_layer_partition_list) != pipeline_model_parallel_size:
+            raise ValueError(
+                '--pipeline-layer-partition length must match --pipeline-model-parallel-size '
+                f'({len(args.pipeline_layer_partition_list)=}, {pipeline_model_parallel_size=}).'
+            )
+        if not all(isinstance(i, int) and i > 0 for i in args.pipeline_layer_partition_list):
+            raise ValueError(
+                '--pipeline-layer-partition entries must all be positive integers '
+                f'({args.pipeline_layer_partition_list=}).'
+            )
+        if sum(args.pipeline_layer_partition_list) != num_layers:
+            raise ValueError(
+                '--pipeline-layer-partition sum must match --num-layers '
+                f'({sum(args.pipeline_layer_partition_list)=}, {num_layers=}).'
+            )
+
+    args.virtual_pipeline_layer_partition_list = getattr(
+        args, 'virtual_pipeline_layer_partition', None
+    )
+    if args.virtual_pipeline_layer_partition_list is not None:
+        pipeline_model_parallel_layout = getattr(args, 'pipeline_model_parallel_layout', None)
+        pipeline_layer_partition = getattr(args, 'pipeline_layer_partition', None)
+        first_pipeline_num_layers = getattr(args, 'num_layers_in_first_pipeline_stage', None)
+        decoder_first_pipeline_num_layers = getattr(
+            args, 'decoder_first_pipeline_num_layers', None
+        )
+        last_pipeline_num_layers = getattr(args, 'num_layers_in_last_pipeline_stage', None)
+        decoder_last_pipeline_num_layers = getattr(args, 'decoder_last_pipeline_num_layers', None)
+        account_for_embedding_in_pipeline_split = getattr(
+            args, 'account_for_embedding_in_pipeline_split', False
+        )
+        account_for_loss_in_pipeline_split = getattr(
+            args, 'account_for_loss_in_pipeline_split', False
+        )
+        num_layers_per_virtual_pipeline_stage = getattr(
+            args, 'num_layers_per_virtual_pipeline_stage', None
+        )
+        num_virtual_stages_per_pipeline_rank = getattr(
+            args, 'num_virtual_stages_per_pipeline_rank', None
+        )
+        pipeline_model_parallel_size = getattr(args, 'pipeline_model_parallel_size', None)
+        num_layers = getattr(args, 'num_layers', None)
+
+        if any(
+            not isinstance(layer_count, int) or layer_count <= 0
+            for row in args.virtual_pipeline_layer_partition_list
+            for layer_count in row
+        ):
+            raise ValueError(
+                '--virtual-pipeline-layer-partition entries must all be positive integers '
+                f'({args.virtual_pipeline_layer_partition_list=}).'
+            )
+        if pipeline_layer_partition is not None:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition cannot be used with '
+                '--pipeline-layer-partition.'
+            )
+        if pipeline_model_parallel_layout is not None:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition cannot be used with '
+                '--pipeline-model-parallel-layout.'
+            )
+        if first_pipeline_num_layers is not None or decoder_first_pipeline_num_layers is not None:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition cannot be used with '
+                '--decoder-first-pipeline-num-layers.'
+            )
+        if last_pipeline_num_layers is not None or decoder_last_pipeline_num_layers is not None:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition cannot be used with '
+                '--decoder-last-pipeline-num-layers.'
+            )
+        if account_for_embedding_in_pipeline_split:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition cannot be used with '
+                '--account-for-embedding-in-pipeline-split.'
+            )
+        if account_for_loss_in_pipeline_split:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition cannot be used with '
+                '--account-for-loss-in-pipeline-split.'
+            )
+        if num_virtual_stages_per_pipeline_rank is not None:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition cannot be used with '
+                '--num-virtual-stages-per-pipeline-rank.'
+            )
+        if len(args.virtual_pipeline_layer_partition_list) != pipeline_model_parallel_size:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition row count must match '
+                f'--pipeline-model-parallel-size ({len(args.virtual_pipeline_layer_partition_list)=}, '
+                f'{pipeline_model_parallel_size=}).'
+            )
+        if any(len(row) == 0 for row in args.virtual_pipeline_layer_partition_list):
+            raise ValueError('--virtual-pipeline-layer-partition rows must not be empty.')
+        virtual_pipeline_model_parallel_size = len(args.virtual_pipeline_layer_partition_list[0])
+        if virtual_pipeline_model_parallel_size <= 1:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition must specify more than one virtual chunk.'
+            )
+        if any(
+            len(row) != virtual_pipeline_model_parallel_size
+            for row in args.virtual_pipeline_layer_partition_list
+        ):
+            raise ValueError('--virtual-pipeline-layer-partition rows must have equal length.')
+        if num_layers_per_virtual_pipeline_stage is not None:
+            transformer_pipeline_model_parallel_size = getattr(
+                args, 'transformer_pipeline_model_parallel_size', pipeline_model_parallel_size
+            )
+            if num_layers % transformer_pipeline_model_parallel_size != 0:
+                raise ValueError(
+                    'number of layers of the model must be divisible by pipeline model '
+                    'parallel size.'
+                )
+            num_layers_per_pipeline_stage = num_layers // transformer_pipeline_model_parallel_size
+            if num_layers_per_pipeline_stage % num_layers_per_virtual_pipeline_stage != 0:
+                raise ValueError(
+                    'number of layers per pipeline stage must be divisible by '
+                    '--num-layers-per-virtual-pipeline-stage.'
+                )
+            derived_virtual_pipeline_model_parallel_size = (
+                num_layers_per_pipeline_stage // num_layers_per_virtual_pipeline_stage
+            )
+            if virtual_pipeline_model_parallel_size != derived_virtual_pipeline_model_parallel_size:
+                raise ValueError(
+                    '--virtual-pipeline-layer-partition column count must match the virtual '
+                    'pipeline model parallel size derived from '
+                    '--num-layers-per-virtual-pipeline-stage '
+                    f'({virtual_pipeline_model_parallel_size=}, '
+                    f'{derived_virtual_pipeline_model_parallel_size=}).'
+                )
+            virtual_pipeline_model_parallel_size = derived_virtual_pipeline_model_parallel_size
+        if sum(sum(row) for row in args.virtual_pipeline_layer_partition_list) != num_layers:
+            raise ValueError(
+                '--virtual-pipeline-layer-partition sum must match --num-layers '
+                f'({sum(sum(row) for row in args.virtual_pipeline_layer_partition_list)=}, '
+                f'{num_layers=}).'
+            )
+        args.virtual_pipeline_model_parallel_size = virtual_pipeline_model_parallel_size
+
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -917,7 +1168,9 @@ def validate_args(args, defaults={}):
         f'{args.pipeline_model_parallel_layout=}.'
     )
 
-    if args.pipeline_model_parallel_layout is not None:
+    if args.virtual_pipeline_layer_partition_list is not None:
+        pass
+    elif args.pipeline_model_parallel_layout is not None:
         # Parse the input flattened layout to a list and get the vpp size.
         # We will validate the layout more carefully in the TransformerConfig constructor.
         num_stages = PipelineParallelLayerLayout.get_num_stages_from_str(args.pipeline_model_parallel_layout)
@@ -976,11 +1229,16 @@ def validate_args(args, defaults={}):
                 assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                     'Number of layers should be divisible by the pipeline-model-parallel size'
 
+    pipeline_schedule = getattr(args, 'pipeline_schedule', 'default')
     if args.virtual_pipeline_model_parallel_size is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
                 'When interleaved schedule is used, pipeline-model-parallel size '\
                 'should be greater than 1'
+        elif pipeline_schedule == 'primitive':
+            # Primitive schedule has its own table-driven p2p ordering and supports PP_SIZE=2
+            # with blocking/non-overlapped p2p for debugging.
+            pass
         else:
             assert args.pipeline_model_parallel_size > 2, \
                 'When interleaved schedule is used and p2p communication overlap is disabled, '\
@@ -995,6 +1253,27 @@ def validate_args(args, defaults={}):
             print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
                 'since non-interleaved schedule does not support overlapping p2p communication '
                 'and aligned param AG')
+
+    if pipeline_schedule == 'primitive':
+        if args.pipeline_model_parallel_size <= 1:
+            raise ValueError('--pipeline-schedule primitive requires pipeline parallelism.')
+        if getattr(args, 'virtual_pipeline_layer_partition_list', None) is None:
+            raise ValueError(
+                '--pipeline-schedule primitive requires --virtual-pipeline-layer-partition.'
+            )
+        if args.virtual_pipeline_model_parallel_size is None:
+            raise ValueError(
+                '--pipeline-schedule primitive requires virtual pipeline parallelism.'
+            )
+        trace_dir = getattr(args, 'primitive_schedule_trace_dir', None)
+        trace_iteration = getattr(args, 'primitive_schedule_trace_iteration', None)
+        if trace_dir is not None and trace_iteration is None:
+            raise ValueError(
+                '--primitive-schedule-trace-dir requires '
+                '--primitive-schedule-trace-iteration.'
+            )
+        if trace_iteration is not None and trace_iteration < 0:
+            raise ValueError('--primitive-schedule-trace-iteration must be non-negative.')
 
     print_rank_0(
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
@@ -2025,6 +2304,8 @@ def _add_network_size_args(parser):
         "activation_func",
         # types affect docstring
         "pipeline_model_parallel_layout",
+        "pipeline_layer_partition",
+        "virtual_pipeline_layer_partition",
         "window_size",
         "window_attn_skip_freq",
         "no_rope_freq",
@@ -2738,6 +3019,28 @@ def _add_distributed_args(parser):
                        'Replicated stages or layers can be described with multiplication. '
                        'Commas can be used cosmetically. '
                        'Default None is not using this argument to set the layout.'))
+    group.add_argument('--pipeline-layer-partition',
+                       type=pipeline_layer_partition_type, default=None,
+                       help=('Comma-separated decoder transformer layer counts for each physical '
+                       'pipeline rank, e.g. "4,6,5,9". Only non-virtual pipeline parallelism '
+                       'is supported.'))
+    group.add_argument('--virtual-pipeline-layer-partition',
+                       type=virtual_pipeline_layer_partition_type, default=None,
+                       help=('Semicolon-separated matrix of comma-separated decoder transformer '
+                       'layer counts for each physical pipeline rank and virtual pipeline chunk, '
+                       'e.g. "2,2;3,3;2,3;5,4".'))
+    group.add_argument('--pipeline-schedule',
+                       type=str, default='default', choices=['default', 'primitive'],
+                       help=('Pipeline schedule implementation to use. Default preserves '
+                       'Megatron behavior.'))
+    group.add_argument('--primitive-schedule-debug', action='store_true',
+                       help='Print per-rank primitive pipeline schedule task traces.')
+    group.add_argument('--primitive-schedule-trace-dir', type=str, default=None,
+                       help='Directory for per-rank primitive schedule JSONL timing traces.')
+    group.add_argument('--primitive-schedule-trace-iteration', type=int, default=None,
+                       help=('Zero-based primitive training-call index to trace when '
+                       '--primitive-schedule-trace-dir is provided. Evaluation/forward-only '
+                       'calls are not counted or traced.'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

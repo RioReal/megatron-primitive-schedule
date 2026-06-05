@@ -19,7 +19,10 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    get_transformer_layer_offset,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -360,6 +363,145 @@ class TestParallelTransformerBlock:
 
 
 class TestPipelineParallelTransformerBlock:
+    def test_pipeline_layer_partition_num_layers_and_offsets(self):
+        pipeline_layer_partition = [4, 6, 5, 9]
+        transformer_config = TransformerConfig(
+            num_layers=24,
+            pipeline_model_parallel_size=4,
+            pipeline_layer_partition=pipeline_layer_partition,
+            pipeline_dtype=torch.bfloat16,
+            hidden_size=128,
+            num_attention_heads=16,
+        )
+
+        expected_offsets = [0, 4, 10, 15]
+        for pp_rank, (expected_num_layers, expected_offset) in enumerate(
+            zip(pipeline_layer_partition, expected_offsets)
+        ):
+            assert (
+                get_num_layers_to_build(transformer_config, pp_rank=pp_rank)
+                == expected_num_layers
+            )
+            assert (
+                get_transformer_layer_offset(transformer_config, pp_rank=pp_rank)
+                == expected_offset
+            )
+
+    def test_virtual_pipeline_layer_partition_num_layers_and_offsets(self):
+        virtual_pipeline_layer_partition = [[2, 2], [3, 3], [2, 3], [5, 4]]
+        transformer_config = TransformerConfig(
+            num_layers=24,
+            pipeline_model_parallel_size=4,
+            virtual_pipeline_model_parallel_size=2,
+            virtual_pipeline_layer_partition=virtual_pipeline_layer_partition,
+            pipeline_dtype=torch.bfloat16,
+            hidden_size=128,
+            num_attention_heads=16,
+        )
+
+        expected_offsets = [[0, 12], [2, 14], [5, 17], [7, 20]]
+        for pp_rank, row in enumerate(virtual_pipeline_layer_partition):
+            for vp_stage, expected_num_layers in enumerate(row):
+                assert (
+                    get_num_layers_to_build(
+                        transformer_config, vp_stage=vp_stage, pp_rank=pp_rank
+                    )
+                    == expected_num_layers
+                )
+                assert (
+                    get_transformer_layer_offset(
+                        transformer_config, vp_stage=vp_stage, pp_rank=pp_rank
+                    )
+                    == expected_offsets[pp_rank][vp_stage]
+                )
+
+    @pytest.mark.parametrize(
+        "extra_config, match",
+        [
+            (
+                {"pipeline_layer_partition": [4, 6, 5]},
+                "length must match pipeline_model_parallel_size",
+            ),
+            ({"pipeline_layer_partition": [4, 6, 5, 8]}, "sum must match num_layers"),
+            (
+                {"pipeline_layer_partition": [4, 0, 5, 15]},
+                "entries must all be positive integers",
+            ),
+            (
+                {
+                    "pipeline_layer_partition": [4, 6, 5, 9],
+                    "virtual_pipeline_model_parallel_size": 2,
+                },
+                "does not support virtual pipeline parallelism",
+            ),
+            (
+                {
+                    "pipeline_layer_partition": [4, 6, 5, 9],
+                    "pipeline_model_parallel_layout": [
+                        ["embedding"],
+                        ["decoder"],
+                        ["decoder"],
+                        ["loss"],
+                    ],
+                },
+                "cannot be set with pipeline_model_parallel_layout",
+            ),
+            (
+                {
+                    "pipeline_layer_partition": [4, 6, 5, 9],
+                    "num_layers_in_first_pipeline_stage": 4,
+                },
+                "num_layers_in_first_pipeline_stage",
+            ),
+            (
+                {
+                    "pipeline_layer_partition": [4, 6, 5, 9],
+                    "num_layers_in_last_pipeline_stage": 9,
+                },
+                "num_layers_in_first_pipeline_stage",
+            ),
+            (
+                {
+                    "pipeline_layer_partition": [4, 6, 5, 9],
+                    "account_for_embedding_in_pipeline_split": True,
+                },
+                "account_for_embedding_in_pipeline_split",
+            ),
+            (
+                {
+                    "pipeline_layer_partition": [4, 6, 5, 9],
+                    "account_for_loss_in_pipeline_split": True,
+                },
+                "account_for_embedding_in_pipeline_split",
+            ),
+        ],
+    )
+    def test_pipeline_layer_partition_validation(self, extra_config, match):
+        config_kwargs = dict(
+            num_layers=24,
+            pipeline_model_parallel_size=4,
+            pipeline_dtype=torch.bfloat16,
+            hidden_size=128,
+            num_attention_heads=16,
+        )
+        config_kwargs.update(extra_config)
+
+        with pytest.raises(ValueError, match=match):
+            TransformerConfig(**config_kwargs)
+
+    def test_virtual_pipeline_layer_partition_rejects_pipeline_layer_partition(self):
+        with pytest.raises(ValueError, match="cannot be set with pipeline_layer_partition"):
+            TransformerConfig(
+                num_layers=24,
+                pipeline_model_parallel_size=4,
+                virtual_pipeline_model_parallel_size=2,
+                virtual_pipeline_layer_partition=[[2, 2], [3, 3], [2, 3], [5, 4]],
+                pipeline_layer_partition=[4, 6, 5, 9],
+                pipeline_dtype=torch.bfloat16,
+                hidden_size=128,
+                num_attention_heads=16,
+            )
+
     @pytest.mark.parametrize(
         "num_layers, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, "
         "account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split, "
