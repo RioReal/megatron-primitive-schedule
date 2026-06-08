@@ -233,6 +233,7 @@ def test_primitive_schedule_allows_pp2_without_p2p_overlap(monkeypatch):
             '/tmp/primitive-trace',
             '--primitive-schedule-trace-iteration',
             '0',
+            '--pipeline-schedule-trace-compute-only',
         ],
     )
 
@@ -244,6 +245,9 @@ def test_primitive_schedule_allows_pp2_without_p2p_overlap(monkeypatch):
     assert args.virtual_pipeline_model_parallel_size == 2
     assert args.primitive_schedule_trace_dir == '/tmp/primitive-trace'
     assert args.primitive_schedule_trace_iteration == 0
+    assert args.pipeline_schedule_trace_dir == '/tmp/primitive-trace'
+    assert args.pipeline_schedule_trace_iteration == 0
+    assert args.pipeline_schedule_trace_compute_only is True
 
 
 def test_primitive_schedule_trace_dir_requires_iteration(monkeypatch):

@@ -3292,8 +3292,9 @@ def train(
     forward_backward_func = get_forward_backward_func(
         pipeline_schedule=args.pipeline_schedule,
         primitive_schedule_debug=args.primitive_schedule_debug,
-        primitive_schedule_trace_dir=args.primitive_schedule_trace_dir,
-        primitive_schedule_trace_iteration=args.primitive_schedule_trace_iteration,
+        pipeline_schedule_trace_dir=args.pipeline_schedule_trace_dir,
+        pipeline_schedule_trace_iteration=args.pipeline_schedule_trace_iteration,
+        pipeline_schedule_trace_compute_only=args.pipeline_schedule_trace_compute_only,
     )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
@@ -3862,8 +3863,9 @@ def evaluate(
     forward_backward_func = get_forward_backward_func(
         pipeline_schedule=args.pipeline_schedule,
         primitive_schedule_debug=args.primitive_schedule_debug,
-        primitive_schedule_trace_dir=args.primitive_schedule_trace_dir,
-        primitive_schedule_trace_iteration=args.primitive_schedule_trace_iteration,
+        pipeline_schedule_trace_dir=args.pipeline_schedule_trace_dir,
+        pipeline_schedule_trace_iteration=args.pipeline_schedule_trace_iteration,
+        pipeline_schedule_trace_compute_only=args.pipeline_schedule_trace_compute_only,
     )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(

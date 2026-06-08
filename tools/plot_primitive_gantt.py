@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--trace-dir", required=True)
     parser.add_argument("--iteration", type=int, required=True)
     parser.add_argument("--output", default="primitive_gantt.png")
-    parser.add_argument("--title", default="Primitive pipeline runtime schedule")
+    parser.add_argument("--title", default="Pipeline runtime schedule")
     parser.add_argument("--microbatch", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--phase", type=str, default=None)

@@ -89,6 +89,21 @@ def test_get_forward_backward_func_primitive_schedule():
         schedule.get_forward_backward_func(pp_size=2, vp_size=None, pipeline_schedule="primitive")
 
 
+def test_get_forward_backward_func_pipeline_schedule_trace_wraps_builtin_schedule():
+    forward_backward_func = schedule.get_forward_backward_func(
+        pp_size=2,
+        vp_size=None,
+        pipeline_schedule_trace_dir="/tmp/pipeline-trace",
+        pipeline_schedule_trace_iteration=0,
+        pipeline_schedule_trace_compute_only=True,
+    )
+
+    assert forward_backward_func.func == schedule.forward_backward_pipelining_without_interleaving
+    assert forward_backward_func.keywords["pipeline_schedule_trace_dir"] == "/tmp/pipeline-trace"
+    assert forward_backward_func.keywords["pipeline_schedule_trace_iteration"] == 0
+    assert forward_backward_func.keywords["pipeline_schedule_trace_compute_only"] is True
+
+
 def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)

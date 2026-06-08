@@ -62,7 +62,7 @@ def model_provider() -> GPTModel:
         GPTModel: A small GPT model instance with 2 layers.
     """
     transformer_config: TransformerConfig = TransformerConfig(
-        num_layers=2,
+        num_layers=4,
         hidden_size=12,
         num_attention_heads=4,
         use_cpu_initialization=True,

@@ -1254,6 +1254,37 @@ def validate_args(args, defaults={}):
                 'since non-interleaved schedule does not support overlapping p2p communication '
                 'and aligned param AG')
 
+    pipeline_trace_dir = getattr(args, 'pipeline_schedule_trace_dir', None)
+    primitive_trace_dir = getattr(args, 'primitive_schedule_trace_dir', None)
+    if pipeline_trace_dir is not None and primitive_trace_dir is not None:
+        if pipeline_trace_dir != primitive_trace_dir:
+            raise ValueError(
+                '--pipeline-schedule-trace-dir and --primitive-schedule-trace-dir '
+                'must match when both are provided.'
+            )
+    elif pipeline_trace_dir is None:
+        args.pipeline_schedule_trace_dir = primitive_trace_dir
+
+    pipeline_trace_iteration = getattr(args, 'pipeline_schedule_trace_iteration', None)
+    primitive_trace_iteration = getattr(args, 'primitive_schedule_trace_iteration', None)
+    if pipeline_trace_iteration is not None and primitive_trace_iteration is not None:
+        if pipeline_trace_iteration != primitive_trace_iteration:
+            raise ValueError(
+                '--pipeline-schedule-trace-iteration and '
+                '--primitive-schedule-trace-iteration must match when both are provided.'
+            )
+    elif pipeline_trace_iteration is None:
+        args.pipeline_schedule_trace_iteration = primitive_trace_iteration
+
+    trace_dir = getattr(args, 'pipeline_schedule_trace_dir', None)
+    trace_iteration = getattr(args, 'pipeline_schedule_trace_iteration', None)
+    if trace_dir is not None and trace_iteration is None:
+        raise ValueError(
+            '--pipeline-schedule-trace-dir requires --pipeline-schedule-trace-iteration.'
+        )
+    if trace_iteration is not None and trace_iteration < 0:
+        raise ValueError('--pipeline-schedule-trace-iteration must be non-negative.')
+
     if pipeline_schedule == 'primitive':
         if args.pipeline_model_parallel_size <= 1:
             raise ValueError('--pipeline-schedule primitive requires pipeline parallelism.')
@@ -1265,15 +1296,6 @@ def validate_args(args, defaults={}):
             raise ValueError(
                 '--pipeline-schedule primitive requires virtual pipeline parallelism.'
             )
-        trace_dir = getattr(args, 'primitive_schedule_trace_dir', None)
-        trace_iteration = getattr(args, 'primitive_schedule_trace_iteration', None)
-        if trace_dir is not None and trace_iteration is None:
-            raise ValueError(
-                '--primitive-schedule-trace-dir requires '
-                '--primitive-schedule-trace-iteration.'
-            )
-        if trace_iteration is not None and trace_iteration < 0:
-            raise ValueError('--primitive-schedule-trace-iteration must be non-negative.')
 
     print_rank_0(
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
@@ -3035,12 +3057,18 @@ def _add_distributed_args(parser):
                        'Megatron behavior.'))
     group.add_argument('--primitive-schedule-debug', action='store_true',
                        help='Print per-rank primitive pipeline schedule task traces.')
-    group.add_argument('--primitive-schedule-trace-dir', type=str, default=None,
-                       help='Directory for per-rank primitive schedule JSONL timing traces.')
-    group.add_argument('--primitive-schedule-trace-iteration', type=int, default=None,
-                       help=('Zero-based primitive training-call index to trace when '
-                       '--primitive-schedule-trace-dir is provided. Evaluation/forward-only '
+    group.add_argument('--pipeline-schedule-trace-dir', type=str, default=None,
+                       help='Directory for per-rank pipeline schedule JSONL timing traces.')
+    group.add_argument('--pipeline-schedule-trace-iteration', type=int, default=None,
+                       help=('Zero-based pipeline schedule training-call index to trace when '
+                       '--pipeline-schedule-trace-dir is provided. Evaluation/forward-only '
                        'calls are not counted or traced.'))
+    group.add_argument('--pipeline-schedule-trace-compute-only', action='store_true',
+                       help='Trace only forward/backward compute phases for pipeline schedules.')
+    group.add_argument('--primitive-schedule-trace-dir', type=str, default=None,
+                       help='Alias for --pipeline-schedule-trace-dir.')
+    group.add_argument('--primitive-schedule-trace-iteration', type=int, default=None,
+                       help='Alias for --pipeline-schedule-trace-iteration.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

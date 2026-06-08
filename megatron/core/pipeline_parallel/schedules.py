@@ -49,7 +49,7 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 # Types
 Shape = Union[List[int], torch.Size]
 
-_PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT = 0
+_PIPELINE_SCHEDULE_TRAINING_CALL_COUNT = 0
 
 
 def get_forward_backward_func(
@@ -59,6 +59,9 @@ def get_forward_backward_func(
     primitive_schedule_debug: bool = False,
     primitive_schedule_trace_dir: Optional[str] = None,
     primitive_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_dir: Optional[str] = None,
+    pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -158,6 +161,18 @@ def get_forward_backward_func(
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
+    if pipeline_schedule_trace_dir is None:
+        pipeline_schedule_trace_dir = primitive_schedule_trace_dir
+    if pipeline_schedule_trace_iteration is None:
+        pipeline_schedule_trace_iteration = primitive_schedule_trace_iteration
+    trace_kwargs = {}
+    if pipeline_schedule_trace_dir is not None or pipeline_schedule_trace_iteration is not None:
+        trace_kwargs = {
+            "pipeline_schedule_trace_dir": pipeline_schedule_trace_dir,
+            "pipeline_schedule_trace_iteration": pipeline_schedule_trace_iteration,
+            "pipeline_schedule_trace_compute_only": pipeline_schedule_trace_compute_only,
+        }
+
     if pipeline_schedule == "primitive":
         if pp_size <= 1:
             raise ValueError("--pipeline-schedule primitive requires pipeline parallelism")
@@ -168,6 +183,7 @@ def get_forward_backward_func(
             primitive_schedule_debug=primitive_schedule_debug,
             primitive_schedule_trace_dir=primitive_schedule_trace_dir,
             primitive_schedule_trace_iteration=primitive_schedule_trace_iteration,
+            **trace_kwargs,
         )
 
     if pp_size > 1:
@@ -177,7 +193,148 @@ def get_forward_backward_func(
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = forward_backward_no_pipelining
+    if trace_kwargs:
+        return partial(forward_backward_func, **trace_kwargs)
     return forward_backward_func
+
+
+class _PipelineScheduleTracer:
+    """Per-rank JSONL compute tracer for one training call."""
+
+    def __init__(
+        self,
+        *,
+        config,
+        schedule_name,
+        forward_only,
+        trace_dir,
+        trace_iteration,
+        compute_only,
+        pp_rank=None,
+        pp_size=None,
+    ):
+        global _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT
+
+        self.trace_file = None
+        self.schedule_name = schedule_name
+        self.compute_only = compute_only
+        self.pp_rank = 0 if pp_rank is None else pp_rank
+        self.pp_size = pp_size or getattr(config, "pipeline_model_parallel_size", 1)
+        self.primitive_iteration = None
+
+        if trace_dir is None and trace_iteration is None:
+            return
+
+        if not forward_only:
+            self.primitive_iteration = _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT
+            _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT += 1
+
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        self.global_rank = global_rank
+        enabled_for_this_call = (
+            trace_dir is not None
+            and trace_iteration is not None
+            and self.primitive_iteration == trace_iteration
+        )
+        print(
+            "[pipeline-schedule-trace] "
+            f"rank={global_rank} schedule={schedule_name} forward_only={forward_only} "
+            f"trace_dir={trace_dir} target_iteration={trace_iteration} "
+            f"current_counter={self.primitive_iteration} enabled_for_this_call={enabled_for_this_call}",
+            flush=True,
+        )
+        if not enabled_for_this_call:
+            return
+
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_path = os.path.join(trace_dir, f"rank_{global_rank}_iter_{trace_iteration}.jsonl")
+        self.trace_file = open(trace_path, "w", encoding="utf-8")
+
+    def close(self):
+        if self.trace_file is not None:
+            self.trace_file.close()
+            self.trace_file = None
+
+    def cuda_synchronize_if_initialized(self):
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+
+    @contextlib.contextmanager
+    def region(
+        self,
+        *,
+        phase,
+        op_type,
+        microbatch,
+        vp_rank=None,
+        model_chunk_id=None,
+        logical_stage=None,
+    ):
+        if self.trace_file is None:
+            yield
+            return
+        if self.compute_only and phase not in {"forward_compute", "backward_compute"}:
+            yield
+            return
+
+        if logical_stage is None:
+            logical_stage = self.pp_rank
+            if model_chunk_id is not None:
+                logical_stage = model_chunk_id * self.pp_size + self.pp_rank
+        if vp_rank is None:
+            vp_rank = model_chunk_id
+
+        self.cuda_synchronize_if_initialized()
+        t_start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.cuda_synchronize_if_initialized()
+            t_end = time.perf_counter()
+            event = {
+                "pipeline_iteration": self.primitive_iteration,
+                "primitive_iteration": self.primitive_iteration,
+                "rank": self.global_rank,
+                "pp_rank": self.pp_rank,
+                "vp_rank": vp_rank,
+                "model_chunk_id": model_chunk_id,
+                "logical_stage": logical_stage,
+                "microbatch": microbatch,
+                "op_type": op_type,
+                "phase": phase,
+                "schedule": self.schedule_name,
+                "t_start": t_start,
+                "t_end": t_end,
+            }
+            self.trace_file.write(json.dumps(event) + "\n")
+            self.trace_file.flush()
+
+
+def _make_pipeline_schedule_tracer(
+    *,
+    config,
+    schedule_name,
+    forward_only,
+    trace_dir=None,
+    trace_iteration=None,
+    compute_only=False,
+    pp_rank=None,
+    pp_size=None,
+):
+    return _PipelineScheduleTracer(
+        config=config,
+        schedule_name=schedule_name,
+        forward_only=forward_only,
+        trace_dir=trace_dir,
+        trace_iteration=trace_iteration,
+        compute_only=compute_only,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+    )
 
 
 def forward_backward_primitive_schedule(
@@ -199,9 +356,12 @@ def forward_backward_primitive_schedule(
     primitive_schedule_debug: bool = False,
     primitive_schedule_trace_dir: Optional[str] = None,
     primitive_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_dir: Optional[str] = None,
+    pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run the primitive table-driven pipeline schedule."""
-    global _PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT
+    global _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT
 
     if not isinstance(model, list):
         raise ValueError("--pipeline-schedule primitive requires interleaved model chunks")
@@ -296,10 +456,16 @@ def forward_backward_primitive_schedule(
         if torch.distributed.is_available() and torch.distributed.is_initialized()
         else 0
     )
+    trace_dir = pipeline_schedule_trace_dir or primitive_schedule_trace_dir
+    trace_iteration = (
+        pipeline_schedule_trace_iteration
+        if pipeline_schedule_trace_iteration is not None
+        else primitive_schedule_trace_iteration
+    )
     primitive_iteration = None
-    if not forward_only:
-        primitive_iteration = _PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT
-        _PRIMITIVE_SCHEDULE_TRAINING_CALL_COUNT += 1
+    if not forward_only and (trace_dir is not None or trace_iteration is not None):
+        primitive_iteration = _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT
+        _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT += 1
 
     def trace(task, phase):
         if primitive_schedule_debug:
@@ -321,21 +487,64 @@ def forward_backward_primitive_schedule(
 
     trace_file = None
     trace_enabled = (
-        primitive_schedule_trace_dir is not None
-        and primitive_schedule_trace_iteration is not None
-        and primitive_iteration == primitive_schedule_trace_iteration
+        trace_dir is not None and trace_iteration is not None and primitive_iteration == trace_iteration
     )
+    if trace_dir is not None:
+        print(
+            "[pipeline-schedule-trace] "
+            f"rank={global_rank} schedule=primitive forward_only={forward_only} "
+            f"trace_dir={trace_dir} target_iteration={trace_iteration} "
+            f"current_counter={primitive_iteration} enabled_for_this_call={trace_enabled}",
+            flush=True,
+        )
 
     def cuda_synchronize_if_initialized():
         if torch.cuda.is_available() and torch.cuda.is_initialized():
             torch.cuda.synchronize()
+
+    def write_trace_event(task, phase, t_start=None, t_end=None):
+        if trace_file is None:
+            return
+        timestamp = time.perf_counter()
+        if t_start is None:
+            t_start = timestamp
+        if t_end is None:
+            t_end = t_start
+        event = {
+            "pipeline_iteration": primitive_iteration,
+            "primitive_iteration": primitive_iteration,
+            "rank": global_rank,
+            "pp_rank": None if task is None else task.pp_rank,
+            "vp_rank": None if task is None else task.vp_rank,
+            "model_chunk_id": None if task is None else task.vp_rank,
+            "microbatch": None if task is None else task.microbatch_id,
+            "logical_stage": None if task is None else task.logical_stage_idx,
+            "op_index": None if task is None else task.op_index,
+            "op_type": None if task is None else ("forward" if task.is_forward else "backward"),
+            "phase": phase,
+            "schedule": "primitive",
+            "predicted_start_time": None if task is None else task.start_time,
+            "predicted_end_time": None if task is None else task.end_time,
+            "t_start": t_start,
+            "t_end": t_end,
+        }
+        trace_file.write(json.dumps(event) + "\n")
+        trace_file.flush()
 
     @contextlib.contextmanager
     def trace_region(task, phase):
         if trace_file is None:
             yield
             return
+        if pipeline_schedule_trace_compute_only and phase not in {
+            "forward_compute",
+            "backward_compute",
+        }:
+            yield
+            return
 
+        if not pipeline_schedule_trace_compute_only:
+            write_trace_event(task, f"before_{phase}")
         cuda_synchronize_if_initialized()
         t_start = time.perf_counter()
         try:
@@ -343,23 +552,9 @@ def forward_backward_primitive_schedule(
         finally:
             cuda_synchronize_if_initialized()
             t_end = time.perf_counter()
-            event = {
-                "primitive_iteration": primitive_iteration,
-                "rank": global_rank,
-                "pp_rank": task.pp_rank,
-                "vp_rank": task.vp_rank,
-                "microbatch": task.microbatch_id,
-                "logical_stage": task.logical_stage_idx,
-                "op_index": task.op_index,
-                "op_type": "forward" if task.is_forward else "backward",
-                "phase": phase,
-                "predicted_start_time": task.start_time,
-                "predicted_end_time": task.end_time,
-                "t_start": t_start,
-                "t_end": t_end,
-            }
-            trace_file.write(json.dumps(event) + "\n")
-            trace_file.flush()
+            write_trace_event(task, phase, t_start=t_start, t_end=t_end)
+            if not pipeline_schedule_trace_compute_only:
+                write_trace_event(task, f"after_{phase}")
 
     no_sync_func = config.no_sync_func
     if isinstance(no_sync_func, list):
@@ -418,12 +613,13 @@ def forward_backward_primitive_schedule(
     local_tasks = primitive_schedule.per_rank_tasks[pp_rank]
 
     if trace_enabled:
-        os.makedirs(primitive_schedule_trace_dir, exist_ok=True)
+        os.makedirs(trace_dir, exist_ok=True)
         trace_path = os.path.join(
-            primitive_schedule_trace_dir,
-            f"rank_{global_rank}_iter_{primitive_schedule_trace_iteration}.jsonl",
+            trace_dir,
+            f"rank_{global_rank}_iter_{trace_iteration}.jsonl",
         )
         trace_file = open(trace_path, "w", encoding="utf-8")
+        write_trace_event(None, "trace_start")
 
     should_disable_grad_sync = not forward_only and (
         config.finalize_model_grads_func is not None or config.grad_sync_func is not None
@@ -1042,6 +1238,9 @@ def forward_backward_no_pipelining(
     p2p_communicator: Optional[P2PCommunicator] = None,  # unused
     pg_collection: Optional[ProcessGroupCollection] = None,
     force_all_reduce: Optional[bool] = False,
+    pipeline_schedule_trace_dir: Optional[str] = None,
+    pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
@@ -1081,6 +1280,16 @@ def forward_backward_no_pipelining(
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
+    schedule_tracer = _make_pipeline_schedule_tracer(
+        config=config,
+        schedule_name="no_pipeline",
+        forward_only=forward_only,
+        trace_dir=pipeline_schedule_trace_dir,
+        trace_iteration=pipeline_schedule_trace_iteration,
+        compute_only=pipeline_schedule_trace_compute_only,
+        pp_rank=0,
+        pp_size=1,
+    )
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
@@ -1135,22 +1344,30 @@ def forward_backward_no_pipelining(
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
-                output_tensor, num_tokens = forward_step(
-                    forward_step_func,
-                    data_iterator,
-                    model,
-                    num_microbatches,
-                    input_tensor,
-                    forward_data_store,
-                    config,
-                    pg_collection.cp.size(),
-                    collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                    current_microbatch=i,
-                )
+                with schedule_tracer.region(
+                    phase="forward_compute", op_type="forward", microbatch=i
+                ):
+                    output_tensor, num_tokens = forward_step(
+                        forward_step_func,
+                        data_iterator,
+                        model,
+                        num_microbatches,
+                        input_tensor,
+                        forward_data_store,
+                        config,
+                        pg_collection.cp.size(),
+                        collect_non_loss_data,
+                        is_first_microbatch=check_first_val_step(
+                            first_val_step, forward_only, i == 0
+                        ),
+                        current_microbatch=i,
+                    )
                 total_num_tokens += num_tokens
                 if not forward_only:
-                    backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    with schedule_tracer.region(
+                        phase="backward_compute", op_type="backward", microbatch=i
+                    ):
+                        backward_step(input_tensor, output_tensor, output_tensor_grad, config)
                     # Release the autograd graph head before the next forward_step.
                     # Without this, the previous microbatch's output_tensor stays
                     # live until the next iteration rebinds the variable, deferring
@@ -1160,26 +1377,34 @@ def forward_backward_no_pipelining(
                     del output_tensor
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            pg_collection.cp.size(),
-            collect_non_loss_data,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, num_microbatches == 1
-            ),
-            current_microbatch=num_microbatches - 1,
-        )
+        with schedule_tracer.region(
+            phase="forward_compute", op_type="forward", microbatch=num_microbatches - 1
+        ):
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                pg_collection.cp.size(),
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, num_microbatches == 1
+                ),
+                current_microbatch=num_microbatches - 1,
+            )
 
         total_num_tokens += num_tokens
 
         if not forward_only:
-            backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            with schedule_tracer.region(
+                phase="backward_compute",
+                op_type="backward",
+                microbatch=num_microbatches - 1,
+            ):
+                backward_step(input_tensor, output_tensor, output_tensor_grad, config)
             del output_tensor
 
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -1210,6 +1435,7 @@ def forward_backward_no_pipelining(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
+    schedule_tracer.close()
     return forward_data_store
 
 
@@ -1354,6 +1580,9 @@ def forward_backward_pipelining_with_interleaving(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
     force_all_reduce: Optional[bool] = False,
+    pipeline_schedule_trace_dir: Optional[str] = None,
+    pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -1493,6 +1722,16 @@ def forward_backward_pipelining_with_interleaving(
 
     pipeline_parallel_size = p2p_communicator.pp_group.size()
     pipeline_parallel_rank = p2p_communicator.pp_group.rank()
+    schedule_tracer = _make_pipeline_schedule_tracer(
+        config=config,
+        schedule_name="interleaved",
+        forward_only=forward_only,
+        trace_dir=pipeline_schedule_trace_dir,
+        trace_iteration=pipeline_schedule_trace_iteration,
+        compute_only=pipeline_schedule_trace_compute_only,
+        pp_rank=pipeline_parallel_rank,
+        pp_size=pipeline_parallel_size,
+    )
 
     if (
         config.microbatch_group_size_per_vp_stage > num_microbatches
@@ -1728,26 +1967,34 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id, microbatch_id
         )
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator[model_chunk_id],
-            model[model_chunk_id],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step,
-                forward_only,
-                is_first_microbatch_for_model_chunk(virtual_microbatch_id),
-            ),
-            current_microbatch=microbatch_id,
-            vp_stage=model_chunk_id,
-            is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group),
-        )
+        with schedule_tracer.region(
+            phase="forward_compute",
+            op_type="forward",
+            microbatch=microbatch_id,
+            vp_rank=model_chunk_id,
+            model_chunk_id=model_chunk_id,
+        ):
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator[model_chunk_id],
+                model[model_chunk_id],
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step,
+                    forward_only,
+                    is_first_microbatch_for_model_chunk(virtual_microbatch_id),
+                ),
+                current_microbatch=microbatch_id,
+                vp_stage=model_chunk_id,
+                is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id)
+                and is_pp_last_stage(pp_group),
+            )
 
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
 
@@ -1801,7 +2048,18 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
-        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        # Built-in interleaved backward microbatch bookkeeping is intentionally left untouched.
+        # The forward lookup helper asserts forward=True, so omit this trace label for now.
+        with schedule_tracer.region(
+            phase="backward_compute",
+            op_type="backward",
+            microbatch=None,
+            vp_rank=model_chunk_id,
+            model_chunk_id=model_chunk_id,
+        ):
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, config
+            )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
@@ -2446,6 +2704,7 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
+    schedule_tracer.close()
     return forward_data_store
 
 
@@ -2499,6 +2758,9 @@ def forward_backward_pipelining_without_interleaving(
         Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
     ] = None,
     force_all_reduce: Optional[bool] = False,
+    pipeline_schedule_trace_dir: Optional[str] = None,
+    pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -2596,6 +2858,17 @@ def forward_backward_pipelining_without_interleaving(
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
 
+    schedule_tracer = _make_pipeline_schedule_tracer(
+        config=config,
+        schedule_name="non_interleaved",
+        forward_only=forward_only,
+        trace_dir=pipeline_schedule_trace_dir,
+        trace_iteration=pipeline_schedule_trace_iteration,
+        compute_only=pipeline_schedule_trace_compute_only,
+        pp_rank=p2p_communicator.pp_group.rank(),
+        pp_size=p2p_communicator.pp_group.size(),
+    )
+
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -2673,6 +2946,7 @@ def forward_backward_pipelining_without_interleaving(
     if not forward_only:
         input_tensors = []
         output_tensors = []
+        tensor_microbatch_ids = []
     forward_data_store = []
 
     # Run warmup forward passes.
@@ -2689,27 +2963,29 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-            current_microbatch=i,
-            is_last_stage=p2p_communicator.is_pp_last_stage,
-        )
+        with schedule_tracer.region(phase="forward_compute", op_type="forward", microbatch=i):
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                current_microbatch=i,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
         p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
 
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
+            tensor_microbatch_ids.append(i)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
@@ -2732,23 +3008,27 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
-            ),
-            current_microbatch=i + num_warmup_microbatches,
-            is_last_stage=p2p_communicator.is_pp_last_stage,
-        )
+        forward_microbatch_id = i + num_warmup_microbatches
+        with schedule_tracer.region(
+            phase="forward_compute", op_type="forward", microbatch=forward_microbatch_id
+        ):
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=forward_microbatch_id,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
         total_num_tokens += num_tokens
 
         if forward_only:
@@ -2765,12 +3045,14 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
+            tensor_microbatch_ids.append(forward_microbatch_id)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
+            backward_microbatch_id = tensor_microbatch_ids.pop(0)
 
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
@@ -2778,9 +3060,14 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
-            )
+            with schedule_tracer.region(
+                phase="backward_compute",
+                op_type="backward",
+                microbatch=backward_microbatch_id,
+            ):
+                input_tensor_grad = backward_func(
+                    input_tensor, output_tensor, output_tensor_grad, config
+                )
 
             if last_iteration:
                 input_tensor = None
@@ -2807,14 +3094,20 @@ def forward_backward_pipelining_without_interleaving(
 
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
+            backward_microbatch_id = tensor_microbatch_ids.pop(0)
 
             output_tensor_grad = p2p_communicator.recv_backward(
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
-            )
+            with schedule_tracer.region(
+                phase="backward_compute",
+                op_type="backward",
+                microbatch=backward_microbatch_id,
+            ):
+                input_tensor_grad = backward_func(
+                    input_tensor, output_tensor, output_tensor_grad, config
+                )
 
             p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
 
@@ -2851,4 +3144,5 @@ def forward_backward_pipelining_without_interleaving(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
+    schedule_tracer.close()
     return forward_data_store
