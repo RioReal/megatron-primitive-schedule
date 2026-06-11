@@ -1278,9 +1278,33 @@ def validate_args(args, defaults={}):
 
     trace_dir = getattr(args, 'pipeline_schedule_trace_dir', None)
     trace_iteration = getattr(args, 'pipeline_schedule_trace_iteration', None)
-    if trace_dir is not None and trace_iteration is None:
+    trace_start_iteration = getattr(args, 'pipeline_schedule_trace_start_iteration', None)
+    trace_end_iteration = getattr(args, 'pipeline_schedule_trace_end_iteration', None)
+    if trace_iteration is not None and (
+        trace_start_iteration is not None or trace_end_iteration is not None
+    ):
+        print_rank_0(
+            'WARNING: --pipeline-schedule-trace-iteration takes precedence over '
+            '--pipeline-schedule-trace-start-iteration/--pipeline-schedule-trace-end-iteration.'
+        )
+    elif (trace_start_iteration is None) != (trace_end_iteration is None):
         raise ValueError(
-            '--pipeline-schedule-trace-dir requires --pipeline-schedule-trace-iteration.'
+            '--pipeline-schedule-trace-start-iteration and '
+            '--pipeline-schedule-trace-end-iteration must be set together.'
+        )
+    elif trace_start_iteration is not None:
+        if trace_start_iteration < 0 or trace_end_iteration < 0:
+            raise ValueError('pipeline schedule trace range iterations must be non-negative.')
+        if trace_start_iteration > trace_end_iteration:
+            raise ValueError(
+                '--pipeline-schedule-trace-start-iteration must be <= '
+                '--pipeline-schedule-trace-end-iteration.'
+            )
+    trace_has_target = trace_iteration is not None or trace_start_iteration is not None
+    if trace_dir is not None and not trace_has_target:
+        raise ValueError(
+            '--pipeline-schedule-trace-dir requires --pipeline-schedule-trace-iteration '
+            'or --pipeline-schedule-trace-start-iteration/--pipeline-schedule-trace-end-iteration.'
         )
     if trace_iteration is not None and trace_iteration < 0:
         raise ValueError('--pipeline-schedule-trace-iteration must be non-negative.')
@@ -3063,6 +3087,10 @@ def _add_distributed_args(parser):
                        help=('Zero-based pipeline schedule training-call index to trace when '
                        '--pipeline-schedule-trace-dir is provided. Evaluation/forward-only '
                        'calls are not counted or traced.'))
+    group.add_argument('--pipeline-schedule-trace-start-iteration', type=int, default=None,
+                       help='Inclusive zero-based first training-call index to trace.')
+    group.add_argument('--pipeline-schedule-trace-end-iteration', type=int, default=None,
+                       help='Inclusive zero-based last training-call index to trace.')
     group.add_argument('--pipeline-schedule-trace-compute-only', action='store_true',
                        help='Trace only forward/backward compute phases for pipeline schedules.')
     group.add_argument('--primitive-schedule-trace-dir', type=str, default=None,

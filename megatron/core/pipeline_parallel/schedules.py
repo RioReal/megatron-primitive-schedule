@@ -61,6 +61,8 @@ def get_forward_backward_func(
     primitive_schedule_trace_iteration: Optional[int] = None,
     pipeline_schedule_trace_dir: Optional[str] = None,
     pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_start_iteration: Optional[int] = None,
+    pipeline_schedule_trace_end_iteration: Optional[int] = None,
     pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Retrieves the appropriate forward_backward function given the
@@ -166,10 +168,17 @@ def get_forward_backward_func(
     if pipeline_schedule_trace_iteration is None:
         pipeline_schedule_trace_iteration = primitive_schedule_trace_iteration
     trace_kwargs = {}
-    if pipeline_schedule_trace_dir is not None or pipeline_schedule_trace_iteration is not None:
+    if (
+        pipeline_schedule_trace_dir is not None
+        or pipeline_schedule_trace_iteration is not None
+        or pipeline_schedule_trace_start_iteration is not None
+        or pipeline_schedule_trace_end_iteration is not None
+    ):
         trace_kwargs = {
             "pipeline_schedule_trace_dir": pipeline_schedule_trace_dir,
             "pipeline_schedule_trace_iteration": pipeline_schedule_trace_iteration,
+            "pipeline_schedule_trace_start_iteration": pipeline_schedule_trace_start_iteration,
+            "pipeline_schedule_trace_end_iteration": pipeline_schedule_trace_end_iteration,
             "pipeline_schedule_trace_compute_only": pipeline_schedule_trace_compute_only,
         }
 
@@ -209,6 +218,8 @@ class _PipelineScheduleTracer:
         forward_only,
         trace_dir,
         trace_iteration,
+        trace_start_iteration,
+        trace_end_iteration,
         compute_only,
         pp_rank=None,
         pp_size=None,
@@ -222,7 +233,12 @@ class _PipelineScheduleTracer:
         self.pp_size = pp_size or getattr(config, "pipeline_model_parallel_size", 1)
         self.primitive_iteration = None
 
-        if trace_dir is None and trace_iteration is None:
+        if (
+            trace_dir is None
+            and trace_iteration is None
+            and trace_start_iteration is None
+            and trace_end_iteration is None
+        ):
             return
 
         if not forward_only:
@@ -235,15 +251,21 @@ class _PipelineScheduleTracer:
             else 0
         )
         self.global_rank = global_rank
-        enabled_for_this_call = (
-            trace_dir is not None
-            and trace_iteration is not None
-            and self.primitive_iteration == trace_iteration
-        )
+        if trace_iteration is not None:
+            enabled_for_this_call = self.primitive_iteration == trace_iteration
+        else:
+            enabled_for_this_call = (
+                self.primitive_iteration is not None
+                and trace_start_iteration is not None
+                and trace_end_iteration is not None
+                and trace_start_iteration <= self.primitive_iteration <= trace_end_iteration
+            )
+        enabled_for_this_call = trace_dir is not None and enabled_for_this_call
         print(
             "[pipeline-schedule-trace] "
             f"rank={global_rank} schedule={schedule_name} forward_only={forward_only} "
             f"trace_dir={trace_dir} target_iteration={trace_iteration} "
+            f"target_start={trace_start_iteration} target_end={trace_end_iteration} "
             f"current_counter={self.primitive_iteration} enabled_for_this_call={enabled_for_this_call}",
             flush=True,
         )
@@ -251,7 +273,9 @@ class _PipelineScheduleTracer:
             return
 
         os.makedirs(trace_dir, exist_ok=True)
-        trace_path = os.path.join(trace_dir, f"rank_{global_rank}_iter_{trace_iteration}.jsonl")
+        trace_path = os.path.join(
+            trace_dir, f"rank_{global_rank}_iter_{self.primitive_iteration}.jsonl"
+        )
         self.trace_file = open(trace_path, "w", encoding="utf-8")
 
     def close(self):
@@ -298,6 +322,7 @@ class _PipelineScheduleTracer:
             event = {
                 "pipeline_iteration": self.primitive_iteration,
                 "primitive_iteration": self.primitive_iteration,
+                "iteration": self.primitive_iteration,
                 "rank": self.global_rank,
                 "pp_rank": self.pp_rank,
                 "vp_rank": vp_rank,
@@ -321,6 +346,8 @@ def _make_pipeline_schedule_tracer(
     forward_only,
     trace_dir=None,
     trace_iteration=None,
+    trace_start_iteration=None,
+    trace_end_iteration=None,
     compute_only=False,
     pp_rank=None,
     pp_size=None,
@@ -331,6 +358,8 @@ def _make_pipeline_schedule_tracer(
         forward_only=forward_only,
         trace_dir=trace_dir,
         trace_iteration=trace_iteration,
+        trace_start_iteration=trace_start_iteration,
+        trace_end_iteration=trace_end_iteration,
         compute_only=compute_only,
         pp_rank=pp_rank,
         pp_size=pp_size,
@@ -358,6 +387,8 @@ def forward_backward_primitive_schedule(
     primitive_schedule_trace_iteration: Optional[int] = None,
     pipeline_schedule_trace_dir: Optional[str] = None,
     pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_start_iteration: Optional[int] = None,
+    pipeline_schedule_trace_end_iteration: Optional[int] = None,
     pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run the primitive table-driven pipeline schedule."""
@@ -462,8 +493,15 @@ def forward_backward_primitive_schedule(
         if pipeline_schedule_trace_iteration is not None
         else primitive_schedule_trace_iteration
     )
+    trace_start_iteration = pipeline_schedule_trace_start_iteration
+    trace_end_iteration = pipeline_schedule_trace_end_iteration
     primitive_iteration = None
-    if not forward_only and (trace_dir is not None or trace_iteration is not None):
+    if not forward_only and (
+        trace_dir is not None
+        or trace_iteration is not None
+        or trace_start_iteration is not None
+        or trace_end_iteration is not None
+    ):
         primitive_iteration = _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT
         _PIPELINE_SCHEDULE_TRAINING_CALL_COUNT += 1
 
@@ -486,14 +524,22 @@ def forward_backward_primitive_schedule(
             parallel_state.set_virtual_pipeline_model_parallel_rank(vp_rank)
 
     trace_file = None
-    trace_enabled = (
-        trace_dir is not None and trace_iteration is not None and primitive_iteration == trace_iteration
-    )
+    if trace_iteration is not None:
+        trace_enabled = primitive_iteration == trace_iteration
+    else:
+        trace_enabled = (
+            primitive_iteration is not None
+            and trace_start_iteration is not None
+            and trace_end_iteration is not None
+            and trace_start_iteration <= primitive_iteration <= trace_end_iteration
+        )
+    trace_enabled = trace_dir is not None and trace_enabled
     if trace_dir is not None:
         print(
             "[pipeline-schedule-trace] "
             f"rank={global_rank} schedule=primitive forward_only={forward_only} "
             f"trace_dir={trace_dir} target_iteration={trace_iteration} "
+            f"target_start={trace_start_iteration} target_end={trace_end_iteration} "
             f"current_counter={primitive_iteration} enabled_for_this_call={trace_enabled}",
             flush=True,
         )
@@ -513,6 +559,7 @@ def forward_backward_primitive_schedule(
         event = {
             "pipeline_iteration": primitive_iteration,
             "primitive_iteration": primitive_iteration,
+            "iteration": primitive_iteration,
             "rank": global_rank,
             "pp_rank": None if task is None else task.pp_rank,
             "vp_rank": None if task is None else task.vp_rank,
@@ -616,7 +663,7 @@ def forward_backward_primitive_schedule(
         os.makedirs(trace_dir, exist_ok=True)
         trace_path = os.path.join(
             trace_dir,
-            f"rank_{global_rank}_iter_{trace_iteration}.jsonl",
+            f"rank_{global_rank}_iter_{primitive_iteration}.jsonl",
         )
         trace_file = open(trace_path, "w", encoding="utf-8")
         write_trace_event(None, "trace_start")
@@ -1240,6 +1287,8 @@ def forward_backward_no_pipelining(
     force_all_reduce: Optional[bool] = False,
     pipeline_schedule_trace_dir: Optional[str] = None,
     pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_start_iteration: Optional[int] = None,
+    pipeline_schedule_trace_end_iteration: Optional[int] = None,
     pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
@@ -1286,6 +1335,8 @@ def forward_backward_no_pipelining(
         forward_only=forward_only,
         trace_dir=pipeline_schedule_trace_dir,
         trace_iteration=pipeline_schedule_trace_iteration,
+        trace_start_iteration=pipeline_schedule_trace_start_iteration,
+        trace_end_iteration=pipeline_schedule_trace_end_iteration,
         compute_only=pipeline_schedule_trace_compute_only,
         pp_rank=0,
         pp_size=1,
@@ -1582,6 +1633,8 @@ def forward_backward_pipelining_with_interleaving(
     force_all_reduce: Optional[bool] = False,
     pipeline_schedule_trace_dir: Optional[str] = None,
     pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_start_iteration: Optional[int] = None,
+    pipeline_schedule_trace_end_iteration: Optional[int] = None,
     pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
@@ -1728,6 +1781,8 @@ def forward_backward_pipelining_with_interleaving(
         forward_only=forward_only,
         trace_dir=pipeline_schedule_trace_dir,
         trace_iteration=pipeline_schedule_trace_iteration,
+        trace_start_iteration=pipeline_schedule_trace_start_iteration,
+        trace_end_iteration=pipeline_schedule_trace_end_iteration,
         compute_only=pipeline_schedule_trace_compute_only,
         pp_rank=pipeline_parallel_rank,
         pp_size=pipeline_parallel_size,
@@ -2760,6 +2815,8 @@ def forward_backward_pipelining_without_interleaving(
     force_all_reduce: Optional[bool] = False,
     pipeline_schedule_trace_dir: Optional[str] = None,
     pipeline_schedule_trace_iteration: Optional[int] = None,
+    pipeline_schedule_trace_start_iteration: Optional[int] = None,
+    pipeline_schedule_trace_end_iteration: Optional[int] = None,
     pipeline_schedule_trace_compute_only: bool = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
@@ -2864,6 +2921,8 @@ def forward_backward_pipelining_without_interleaving(
         forward_only=forward_only,
         trace_dir=pipeline_schedule_trace_dir,
         trace_iteration=pipeline_schedule_trace_iteration,
+        trace_start_iteration=pipeline_schedule_trace_start_iteration,
+        trace_end_iteration=pipeline_schedule_trace_end_iteration,
         compute_only=pipeline_schedule_trace_compute_only,
         pp_rank=p2p_communicator.pp_group.rank(),
         pp_size=p2p_communicator.pp_group.size(),

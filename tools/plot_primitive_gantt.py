@@ -8,22 +8,25 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-def load_trace(trace_dir: str, iteration: int) -> pd.DataFrame:
+def load_trace(trace_dir: str, iterations) -> pd.DataFrame:
     rows = []
-    pattern = f"rank_*_iter_{iteration}.jsonl"
-    paths = sorted(Path(trace_dir).glob(pattern))
-    if not paths:
-        raise RuntimeError(f"No trace files matching {pattern!r} found in {trace_dir}")
+    for iteration in iterations:
+        pattern = f"rank_*_iter_{iteration}.jsonl"
+        paths = sorted(Path(trace_dir).glob(pattern))
+        if not paths:
+            raise RuntimeError(f"No trace files matching {pattern!r} found in {trace_dir}")
 
-    for path in paths:
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
+        for path in paths:
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        event = json.loads(line)
+                        event.setdefault("iteration", iteration)
+                        rows.append(event)
 
     if not rows:
-        raise RuntimeError(f"No trace events found for iteration {iteration} in {trace_dir}")
+        raise RuntimeError(f"No trace events found in {trace_dir}")
 
     df = pd.DataFrame(rows)
 
@@ -134,7 +137,9 @@ def plot_gantt(df: pd.DataFrame, output: str, title: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace-dir", required=True)
-    parser.add_argument("--iteration", type=int, required=True)
+    parser.add_argument("--iteration", type=int, default=None)
+    parser.add_argument("--iteration-start", type=int, default=None)
+    parser.add_argument("--iteration-end", type=int, default=None)
     parser.add_argument("--output", default="primitive_gantt.png")
     parser.add_argument("--title", default="Pipeline runtime schedule")
     parser.add_argument("--microbatch", type=int, default=None)
@@ -143,7 +148,16 @@ def main():
     parser.add_argument("--compute-only", action="store_true")
     args = parser.parse_args()
 
-    df = load_trace(args.trace_dir, args.iteration)
+    if args.iteration is not None:
+        iterations = [args.iteration]
+    elif args.iteration_start is not None and args.iteration_end is not None:
+        if args.iteration_start > args.iteration_end:
+            raise RuntimeError("--iteration-start must be <= --iteration-end")
+        iterations = range(args.iteration_start, args.iteration_end + 1)
+    else:
+        raise RuntimeError("Provide --iteration or --iteration-start/--iteration-end.")
+
+    df = load_trace(args.trace_dir, iterations)
 
     if args.compute_only:
         df = df[df["phase"].isin({"forward_compute", "backward_compute"})]

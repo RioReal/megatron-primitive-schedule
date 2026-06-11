@@ -3294,6 +3294,8 @@ def train(
         primitive_schedule_debug=args.primitive_schedule_debug,
         pipeline_schedule_trace_dir=args.pipeline_schedule_trace_dir,
         pipeline_schedule_trace_iteration=args.pipeline_schedule_trace_iteration,
+        pipeline_schedule_trace_start_iteration=args.pipeline_schedule_trace_start_iteration,
+        pipeline_schedule_trace_end_iteration=args.pipeline_schedule_trace_end_iteration,
         pipeline_schedule_trace_compute_only=args.pipeline_schedule_trace_compute_only,
     )
     if args.cuda_graph_impl == "full_iteration":
@@ -3865,6 +3867,8 @@ def evaluate(
         primitive_schedule_debug=args.primitive_schedule_debug,
         pipeline_schedule_trace_dir=args.pipeline_schedule_trace_dir,
         pipeline_schedule_trace_iteration=args.pipeline_schedule_trace_iteration,
+        pipeline_schedule_trace_start_iteration=args.pipeline_schedule_trace_start_iteration,
+        pipeline_schedule_trace_end_iteration=args.pipeline_schedule_trace_end_iteration,
         pipeline_schedule_trace_compute_only=args.pipeline_schedule_trace_compute_only,
     )
     if args.cuda_graph_impl == "full_iteration":
