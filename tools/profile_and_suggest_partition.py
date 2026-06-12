@@ -2,10 +2,24 @@
 
 import argparse
 import json
-import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
+
+try:
+    from tools.primitive_partition_optimizer import (
+        primitive_profile_guided_makespan,
+        primitive_weights_for_partition,
+        solve_primitive_profile_guided_partition,
+        t_split_to_megatron_vpp_string,
+    )
+except ModuleNotFoundError:
+    from primitive_partition_optimizer import (
+        primitive_profile_guided_makespan,
+        primitive_weights_for_partition,
+        solve_primitive_profile_guided_partition,
+        t_split_to_megatron_vpp_string,
+    )
 
 COMPUTE_PHASES = {"forward_compute", "backward_compute"}
 
@@ -21,10 +35,7 @@ def parse_partition(value, pp_size, vpp_size, num_layers):
             item = item.strip()
             if not item:
                 raise ValueError("partition contains an empty value")
-            try:
-                layer_count = int(item)
-            except ValueError as exc:
-                raise ValueError(f"partition value {item!r} is not an integer") from exc
+            layer_count = int(item)
             if layer_count <= 0:
                 raise ValueError("partition values must be positive integers")
             row.append(layer_count)
@@ -41,19 +52,21 @@ def parse_partition(value, pp_size, vpp_size, num_layers):
 
 
 def matrix_to_t_split(partition, pp_size, vpp_size):
-    return [partition[pp_rank][vp_rank] for vp_rank in range(vpp_size) for pp_rank in range(pp_size)]
-
-
-def t_split_to_matrix(t_split, pp_size, vpp_size):
     return [
-        [t_split[vp_rank * pp_size + pp_rank] for vp_rank in range(vpp_size)]
-        for pp_rank in range(pp_size)
+        partition[pp_rank][vp_rank] for vp_rank in range(vpp_size) for pp_rank in range(pp_size)
     ]
 
 
 def format_partition(t_split, pp_size, vpp_size):
-    matrix = t_split_to_matrix(t_split, pp_size, vpp_size)
-    return ";".join(",".join(str(value) for value in row) for row in matrix)
+    return t_split_to_megatron_vpp_string(t_split, pp_size, vpp_size)
+
+
+def validate_partition_string_shape(value, pp_size, vpp_size):
+    rows = value.split(";")
+    if len(rows) != pp_size:
+        raise RuntimeError("suggested partition string has the wrong number of PP rows")
+    if any(len(row.split(",")) != vpp_size for row in rows):
+        raise RuntimeError("suggested partition string has the wrong number of VPP columns")
 
 
 def load_compute_events(trace_dir, iterations):
@@ -78,12 +91,13 @@ def load_compute_events(trace_dir, iterations):
                         raise RuntimeError(
                             f"{path}:{line_number} is missing required fields: {sorted(missing)}"
                         )
-                    logical_stage = event["logical_stage"]
-                    if logical_stage is None:
+                    if event["logical_stage"] is None:
                         raise RuntimeError(f"{path}:{line_number} has logical_stage=None")
-                    event["logical_stage"] = int(logical_stage)
+                    event["logical_stage"] = int(event["logical_stage"])
                     event.setdefault("iteration", iteration)
-                    event["duration_ms"] = (float(event["t_end"]) - float(event["t_start"])) * 1000.0
+                    event["duration_ms"] = (
+                        float(event["t_end"]) - float(event["t_start"])
+                    ) * 1000.0
                     events.append(event)
 
     if not events:
@@ -131,11 +145,6 @@ def profile_by_stage(events, t_split, num_stages, iterations):
             backward_values.append(values["backward"])
             total_values.append(values["forward"] + values["backward"])
 
-        if not forward_values or not backward_values:
-            raise RuntimeError(
-                f"Missing forward/backward compute events for logical stage {stage}."
-            )
-
         layers = t_split[stage]
         forward_ms = statistics.median(forward_values)
         backward_ms = statistics.median(backward_values)
@@ -147,141 +156,115 @@ def profile_by_stage(events, t_split, num_stages, iterations):
                 "forward_ms": forward_ms,
                 "backward_ms": backward_ms,
                 "total_ms": total_ms,
-                "forward_ms_per_layer": forward_ms / layers,
-                "backward_ms_per_layer": backward_ms / layers,
-                "total_ms_per_layer": total_ms / layers,
+                # Diagnostic only: observed/layer = shared slope + bias/layer + noise.
+                # These ratios are not learned as stage-specific model slopes.
+                "observed_fwd_ms_per_layer": forward_ms / layers,
+                "observed_bwd_ms_per_layer": backward_ms / layers,
+                "observed_total_ms_per_layer": total_ms / layers,
             }
         )
     return rows
 
 
-def completion_table_makespan(num_microbatches, num_stages, pp_size, forward_costs, backward_costs):
-    num_ops = 2 * num_stages
-    weights = list(forward_costs) + list(reversed(backward_costs))
-    table = [[math.inf for _ in range(num_ops)] for _ in range(num_microbatches)]
-
-    for microbatch_id in range(num_microbatches):
-        table[microbatch_id][0] = (microbatch_id + 1) * weights[0]
-
-    for op_index in range(1, pp_size):
-        table[0][op_index] = sum(weights[: op_index + 1])
-
-    while True:
-        progress = False
-        unresolved = 0
-        for microbatch_id in range(num_microbatches):
-            for op_index in range(num_ops):
-                if table[microbatch_id][op_index] != math.inf:
-                    continue
-                unresolved += 1
-                if table[microbatch_id][op_index - 1] == math.inf:
-                    continue
-                dep_microbatch_id, dep_op_index = get_prev_b_dependency(
-                    microbatch_id, op_index, num_microbatches, num_stages, pp_size
-                )
-                if table[dep_microbatch_id][dep_op_index] == math.inf:
-                    continue
-                table[microbatch_id][op_index] = (
-                    max(table[dep_microbatch_id][dep_op_index], table[microbatch_id][op_index - 1])
-                    + weights[op_index]
-                )
-                progress = True
-
-        if unresolved == 0:
-            return max(max(row) for row in table)
-        if not progress:
-            raise RuntimeError("primitive schedule makespan simulator made no progress")
+def percentile(values, percentile_value):
+    if not values:
+        raise ValueError("cannot compute percentile of an empty list")
+    if not (0.0 <= percentile_value <= 100.0):
+        raise ValueError("percentile must be in [0, 100]")
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * percentile_value / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    fraction = position - lower
+    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
-def get_prev_b_dependency(microbatch_id, op_index, num_microbatches, num_stages, pp_size):
-    if op_index == num_stages - 1:
-        if microbatch_id == 0:
-            return num_microbatches - 1, op_index - pp_size
-        return microbatch_id - 1, num_stages
+def fit_shared_slope_stage_bias(layers, observed_costs, estimator="min", percentile_value=20.0):
+    """Fit observed_cost[s] ~= a * layers[s] + bias[s].
 
-    if op_index == num_stages:
-        return microbatch_id, op_index - 1
+    The observed per-layer ratio is diagnostic only:
+    observed_cost[s] / layers[s] = shared_slope + bias[s] / layers[s] + noise.
+    """
 
-    if microbatch_id > 0:
-        return microbatch_id - 1, op_index
-
-    dep_microbatch_id = num_microbatches - 1
-    if op_index < num_stages - 1 or op_index >= num_stages + pp_size:
-        dep_op_index = op_index - pp_size
+    ratios = [cost / layer_count for layer_count, cost in zip(layers, observed_costs)]
+    if estimator == "min":
+        slope = min(ratios)
+    elif estimator == "median":
+        slope = statistics.median(ratios)
+    elif estimator == "percentile":
+        slope = percentile(ratios, percentile_value)
     else:
-        dep_op_index = 2 * num_stages - op_index - 1
-    return dep_microbatch_id, dep_op_index
+        raise ValueError(f"unsupported shared slope estimator {estimator!r}")
+    bias = [
+        max(0.0, cost - slope * layer_count)
+        for layer_count, cost in zip(layers, observed_costs)
+    ]
+    return slope, bias
 
 
-def stage_costs(t_split, forward_per_layer, backward_per_layer):
-    forward = [layers * cost for layers, cost in zip(t_split, forward_per_layer)]
-    backward = [layers * cost for layers, cost in zip(t_split, backward_per_layer)]
+def estimate_single_run_shared_slope_and_bias(
+    layers,
+    costs,
+    estimator="min",
+    percentile_value=20.0,
+):
+    return fit_shared_slope_stage_bias(
+        layers,
+        costs,
+        estimator=estimator,
+        percentile_value=percentile_value,
+    )
+
+
+def build_cost_model(profile_rows, estimator, percentile_value):
+    layers = [row["layers"] for row in profile_rows]
+    forward_costs = [row["forward_ms"] for row in profile_rows]
+    backward_costs = [row["backward_ms"] for row in profile_rows]
+    a_fwd, bias_fwd = fit_shared_slope_stage_bias(
+        layers,
+        forward_costs,
+        estimator=estimator,
+        percentile_value=percentile_value,
+    )
+    a_bwd, bias_bwd = fit_shared_slope_stage_bias(
+        layers,
+        backward_costs,
+        estimator=estimator,
+        percentile_value=percentile_value,
+    )
+    return {
+        "a_fwd": a_fwd,
+        "a_bwd": a_bwd,
+        "bias_fwd": bias_fwd,
+        "bias_bwd": bias_bwd,
+    }
+
+
+def stage_costs(t_split, cost_model):
+    forward, backward = primitive_weights_for_partition(
+        t_split,
+        cost_model["a_fwd"],
+        cost_model["a_bwd"],
+        cost_model["bias_fwd"],
+        cost_model["bias_bwd"],
+    )
     total = [fwd + bwd for fwd, bwd in zip(forward, backward)]
     return forward, backward, total
 
 
-def objective(t_split, forward_per_layer, backward_per_layer, num_microbatches, pp_size):
-    forward, backward, total = stage_costs(t_split, forward_per_layer, backward_per_layer)
-    makespan = completion_table_makespan(
-        num_microbatches, len(t_split), pp_size, forward, backward
+def makespan_for_split(t_split, cost_model, num_microbatches, pp_size):
+    return primitive_profile_guided_makespan(
+        B=num_microbatches,
+        N=len(t_split),
+        J=pp_size,
+        t_split=t_split,
+        a_fwd=cost_model["a_fwd"],
+        a_bwd=cost_model["a_bwd"],
+        bias_fwd=cost_model["bias_fwd"],
+        bias_bwd=cost_model["bias_bwd"],
     )
-    return (makespan, max(total), max(total) - min(total))
-
-
-def greedy_balanced_split(num_layers, forward_per_layer, backward_per_layer):
-    costs = [fwd + bwd for fwd, bwd in zip(forward_per_layer, backward_per_layer)]
-    t_split = [1 for _ in costs]
-    for _ in range(num_layers - len(costs)):
-        best_stage = min(
-            range(len(costs)),
-            key=lambda stage: ((t_split[stage] + 1) * costs[stage], stage),
-        )
-        t_split[best_stage] += 1
-    return t_split
-
-
-def improve_split(initial, forward_per_layer, backward_per_layer, num_microbatches, pp_size):
-    best = list(initial)
-    best_score = objective(best, forward_per_layer, backward_per_layer, num_microbatches, pp_size)
-
-    while True:
-        improved = False
-        candidate_best = best
-        candidate_score = best_score
-        for src in range(len(best)):
-            if best[src] <= 1:
-                continue
-            for dst in range(len(best)):
-                if src == dst:
-                    continue
-                candidate = list(best)
-                candidate[src] -= 1
-                candidate[dst] += 1
-                score = objective(
-                    candidate, forward_per_layer, backward_per_layer, num_microbatches, pp_size
-                )
-                if score < candidate_score:
-                    candidate_best = candidate
-                    candidate_score = score
-                    improved = True
-        if not improved:
-            return best, best_score
-        best = candidate_best
-        best_score = candidate_score
-
-
-def suggest_split(current, num_layers, forward_per_layer, backward_per_layer, num_microbatches, pp_size):
-    seeds = [list(current), greedy_balanced_split(num_layers, forward_per_layer, backward_per_layer)]
-    best_split = None
-    best_score = None
-    for seed in seeds:
-        split, score = improve_split(
-            seed, forward_per_layer, backward_per_layer, num_microbatches, pp_size
-        )
-        if best_score is None or score < best_score:
-            best_split = split
-            best_score = score
-    return best_split, best_score
 
 
 def print_profile(rows, pp_size):
@@ -296,23 +279,49 @@ def print_profile(rows, pp_size):
         stage = row["stage"]
         print(
             f"{stage:>5} {stage % pp_size:>3} {stage // pp_size:>3} {row['layers']:>6} "
-            f"{row['forward_ms']:>10.3f} {row['backward_ms']:>10.3f} {row['total_ms']:>10.3f} "
-            f"{row['forward_ms_per_layer']:>11.3f} "
-            f"{row['backward_ms_per_layer']:>11.3f} "
-            f"{row['total_ms_per_layer']:>12.3f}"
+            f"{row['forward_ms']:>10.3f} {row['backward_ms']:>10.3f} "
+            f"{row['total_ms']:>10.3f} {row['observed_fwd_ms_per_layer']:>11.3f} "
+            f"{row['observed_bwd_ms_per_layer']:>11.3f} "
+            f"{row['observed_total_ms_per_layer']:>12.3f}"
         )
 
 
-def print_stage_costs(title, t_split, forward_per_layer, backward_per_layer, pp_size):
-    forward, backward, total = stage_costs(t_split, forward_per_layer, backward_per_layer)
+def print_cost_model(cost_model, estimator):
+    print("\nfitted_cost_model")
+    print("-----------------")
+    print(f"shared_slope_estimator = {estimator}")
+    print(f"a_fwd = {round(cost_model['a_fwd'], 6)}")
+    print(f"a_bwd = {round(cost_model['a_bwd'], 6)}")
+    print(f"bias_fwd = {[round(value, 6) for value in cost_model['bias_fwd']]}")
+    print(f"bias_bwd = {[round(value, 6) for value in cost_model['bias_bwd']]}")
+
+
+def print_stage_costs(title, t_split, cost_model, pp_size):
+    forward, backward, total = stage_costs(t_split, cost_model)
     print(f"\n{title}")
     print("-" * len(title))
-    print(f"{'stage':>5} {'pp':>3} {'vp':>3} {'layers':>6} {'fwd_ms':>10} {'bwd_ms':>10} {'total_ms':>10}")
+    print(
+        f"{'stage':>5} {'pp':>3} {'vp':>3} {'layers':>6} {'fwd_ms':>10} "
+        f"{'bwd_ms':>10} {'total_ms':>10} {'bias_fwd':>10} {'bias_bwd':>10}"
+    )
     for stage, layers in enumerate(t_split):
         print(
             f"{stage:>5} {stage % pp_size:>3} {stage // pp_size:>3} {layers:>6} "
-            f"{forward[stage]:>10.3f} {backward[stage]:>10.3f} {total[stage]:>10.3f}"
+            f"{forward[stage]:>10.3f} {backward[stage]:>10.3f} {total[stage]:>10.3f} "
+            f"{cost_model['bias_fwd'][stage]:>10.3f} {cost_model['bias_bwd'][stage]:>10.3f}"
         )
+
+
+def validate_solution(solution, num_layers, pp_size, vpp_size):
+    if len(solution.t_split) != pp_size * vpp_size:
+        raise RuntimeError("suggested t_split has the wrong length")
+    if sum(solution.t_split) != num_layers:
+        raise RuntimeError("suggested t_split does not sum to num_layers")
+    if any(layers < 1 for layers in solution.t_split):
+        raise RuntimeError("suggested t_split contains a stage with zero layers")
+    validate_partition_string_shape(
+        format_partition(solution.t_split, pp_size, vpp_size), pp_size, vpp_size
+    )
 
 
 def main():
@@ -326,6 +335,12 @@ def main():
     parser.add_argument("--pp-size", type=int, required=True)
     parser.add_argument("--vpp-size", type=int, required=True)
     parser.add_argument("--virtual-pipeline-layer-partition", required=True)
+    parser.add_argument(
+        "--shared-slope-estimator",
+        choices=["min", "median", "percentile"],
+        default="min",
+    )
+    parser.add_argument("--shared-slope-percentile", type=float, default=20.0)
     args = parser.parse_args()
 
     if args.iteration_start < 0 or args.iteration_end < 0:
@@ -340,57 +355,67 @@ def main():
         raise RuntimeError("num-layers must be at least pp-size * vpp-size")
 
     partition = parse_partition(
-        args.virtual_pipeline_layer_partition, args.pp_size, args.vpp_size, args.num_layers
+        args.virtual_pipeline_layer_partition,
+        args.pp_size,
+        args.vpp_size,
+        args.num_layers,
     )
     current_t_split = matrix_to_t_split(partition, args.pp_size, args.vpp_size)
     iterations = range(args.iteration_start, args.iteration_end + 1)
     events = load_compute_events(args.trace_dir, iterations)
     num_microbatches = infer_num_microbatches(events)
     profile_rows = profile_by_stage(events, current_t_split, num_stages, iterations)
-    forward_per_layer = [row["forward_ms_per_layer"] for row in profile_rows]
-    backward_per_layer = [row["backward_ms_per_layer"] for row in profile_rows]
+    cost_model = build_cost_model(
+        profile_rows,
+        estimator=args.shared_slope_estimator,
+        percentile_value=args.shared_slope_percentile,
+    )
+    solution = solve_primitive_profile_guided_partition(
+        B=num_microbatches,
+        N=num_stages,
+        J=args.pp_size,
+        total_layers=args.num_layers,
+        a_fwd=cost_model["a_fwd"],
+        a_bwd=cost_model["a_bwd"],
+        bias_fwd=cost_model["bias_fwd"],
+        bias_bwd=cost_model["bias_bwd"],
+    )
+    validate_solution(solution, args.num_layers, args.pp_size, args.vpp_size)
 
-    suggested_t_split, suggested_score = suggest_split(
+    current_makespan = makespan_for_split(
         current_t_split,
-        args.num_layers,
-        forward_per_layer,
-        backward_per_layer,
+        cost_model,
         num_microbatches,
         args.pp_size,
     )
-    current_score = objective(
-        current_t_split, forward_per_layer, backward_per_layer, num_microbatches, args.pp_size
-    )
+    optimized_makespan = solution.makespan
+    _before_forward, _before_backward, before_total = stage_costs(current_t_split, cost_model)
+    _after_forward, _after_backward, after_total = stage_costs(solution.t_split, cost_model)
 
     print_profile(profile_rows, args.pp_size)
-    print_stage_costs(
-        "predicted_stage_cost_before",
-        current_t_split,
-        forward_per_layer,
-        backward_per_layer,
-        args.pp_size,
-    )
-    print_stage_costs(
-        "predicted_stage_cost_after",
-        suggested_t_split,
-        forward_per_layer,
-        backward_per_layer,
-        args.pp_size,
-    )
+    print_cost_model(cost_model, args.shared_slope_estimator)
+    print_stage_costs("predicted_stage_cost_before", current_t_split, cost_model, args.pp_size)
+    print_stage_costs("predicted_stage_cost_after", solution.t_split, cost_model, args.pp_size)
 
     print("\nsuggestion")
     print("----------")
     print(f"num_microbatches_inferred = {num_microbatches}")
+    print(f"search_method             = {solution.search_method}")
+    print(f"shared_slope_estimator    = {args.shared_slope_estimator}")
+    print(f"a_fwd                     = {cost_model['a_fwd']:.6f}")
+    print(f"a_bwd                     = {cost_model['a_bwd']:.6f}")
+    print(f"bias_fwd                  = {[round(value, 6) for value in cost_model['bias_fwd']]}")
+    print(f"bias_bwd                  = {[round(value, 6) for value in cost_model['bias_bwd']]}")
     print(f"current_t_split           = {current_t_split}")
-    print(f"suggested_t_split         = {suggested_t_split}")
+    print(f"suggested_t_split         = {solution.t_split}")
     print(
         "suggested --virtual-pipeline-layer-partition "
-        f"\"{format_partition(suggested_t_split, args.pp_size, args.vpp_size)}\""
+        f"\"{format_partition(solution.t_split, args.pp_size, args.vpp_size)}\""
     )
-    print(f"predicted_makespan_before_ms = {current_score[0]:.3f}")
-    print(f"predicted_makespan_after_ms  = {suggested_score[0]:.3f}")
-    print(f"predicted_max_stage_before_ms = {current_score[1]:.3f}")
-    print(f"predicted_max_stage_after_ms  = {suggested_score[1]:.3f}")
+    print(f"predicted_makespan_before_ms = {current_makespan:.3f}")
+    print(f"predicted_makespan_after_ms  = {optimized_makespan:.3f}")
+    print(f"predicted_max_stage_before_ms = {max(before_total):.3f}")
+    print(f"predicted_max_stage_after_ms  = {max(after_total):.3f}")
 
 
 if __name__ == "__main__":

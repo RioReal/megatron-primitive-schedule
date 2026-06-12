@@ -50,10 +50,10 @@ def _validate_optimizer_inputs(
     N: int,
     J: int,
     total_layers: int,
-    fwd_per_layer: Sequence[Number],
-    bwd_per_layer: Sequence[Number],
-    fixed_fwd: Optional[Sequence[Number]],
-    fixed_bwd: Optional[Sequence[Number]],
+    a_fwd: Number,
+    a_bwd: Number,
+    bias_fwd: Sequence[Number],
+    bias_bwd: Sequence[Number],
     min_layers_per_stage: Union[int, Sequence[int]],
     max_layers_per_stage: Optional[Union[int, Sequence[int]]],
 ):
@@ -67,15 +67,15 @@ def _validate_optimizer_inputs(
         raise ValueError("N must be divisible by J")
     if total_layers <= 0:
         raise ValueError("total_layers must be positive")
-    if len(fwd_per_layer) != N:
-        raise ValueError("fwd_per_layer length must equal N")
-    if len(bwd_per_layer) != N:
-        raise ValueError("bwd_per_layer length must equal N")
+    a_fwd = float(a_fwd)
+    a_bwd = float(a_bwd)
+    if a_fwd < 0 or a_bwd < 0:
+        raise ValueError("a_fwd and a_bwd must be non-negative")
 
-    fwd = _as_float_list("fwd_per_layer", fwd_per_layer, N)
-    bwd = _as_float_list("bwd_per_layer", bwd_per_layer, N)
-    fixed_forward = _as_float_list("fixed_fwd", fixed_fwd, N)
-    fixed_backward = _as_float_list("fixed_bwd", fixed_bwd, N)
+    fwd = [a_fwd for _ in range(N)]
+    bwd = [a_bwd for _ in range(N)]
+    fixed_forward = _as_float_list("bias_fwd", bias_fwd, N)
+    fixed_backward = _as_float_list("bias_bwd", bias_bwd, N)
 
     mins = _as_int_bounds("min_layers_per_stage", min_layers_per_stage, N, None)
     if any(value is None or value < 0 for value in mins):
@@ -98,26 +98,20 @@ def _validate_optimizer_inputs(
 
 def primitive_weights_for_partition(
     t_split: Sequence[int],
-    fwd_per_layer: Sequence[Number],
-    bwd_per_layer: Sequence[Number],
-    fixed_fwd: Optional[Sequence[Number]] = None,
-    fixed_bwd: Optional[Sequence[Number]] = None,
+    a_fwd: Number,
+    a_bwd: Number,
+    bias_fwd: Sequence[Number],
+    bias_bwd: Sequence[Number],
 ) -> Tuple[List[float], List[float]]:
-    """Return per-stage forward/backward operation weights for a profiled partition."""
+    """Return per-stage operation weights for the shared-slope + stage-bias model."""
 
     N = len(t_split)
-    if len(fwd_per_layer) != N or len(bwd_per_layer) != N:
-        raise ValueError("per-layer cost vectors must have the same length as t_split")
-    fwd_fixed = _as_float_list("fixed_fwd", fixed_fwd, N)
-    bwd_fixed = _as_float_list("fixed_bwd", fixed_bwd, N)
-    forward = [
-        fwd_fixed[stage] + float(fwd_per_layer[stage]) * int(t_split[stage])
-        for stage in range(N)
-    ]
-    backward = [
-        bwd_fixed[stage] + float(bwd_per_layer[stage]) * int(t_split[stage])
-        for stage in range(N)
-    ]
+    fwd_bias = _as_float_list("bias_fwd", bias_fwd, N)
+    bwd_bias = _as_float_list("bias_bwd", bias_bwd, N)
+    a_fwd = float(a_fwd)
+    a_bwd = float(a_bwd)
+    forward = [fwd_bias[stage] + a_fwd * int(t_split[stage]) for stage in range(N)]
+    backward = [bwd_bias[stage] + a_bwd * int(t_split[stage]) for stage in range(N)]
     return forward, backward
 
 
@@ -152,10 +146,10 @@ def primitive_profile_guided_makespan(
     N: int,
     J: int,
     t_split: Sequence[int],
-    fwd_per_layer: Sequence[Number],
-    bwd_per_layer: Sequence[Number],
-    fixed_fwd: Optional[Sequence[Number]] = None,
-    fixed_bwd: Optional[Sequence[Number]] = None,
+    a_fwd: Number,
+    a_bwd: Number,
+    bias_fwd: Sequence[Number],
+    bias_bwd: Sequence[Number],
 ) -> float:
     """Evaluate primitive schedule makespan for a layer partition and profiled costs."""
 
@@ -165,7 +159,7 @@ def primitive_profile_guided_makespan(
         raise ValueError("t_split entries must be positive integers")
 
     forward_weights, backward_weights = primitive_weights_for_partition(
-        t_split, fwd_per_layer, bwd_per_layer, fixed_fwd=fixed_fwd, fixed_bwd=fixed_bwd
+        t_split, a_fwd, a_bwd, bias_fwd, bias_bwd
     )
     # Operations are n in [0, 2N). Backward op n maps to stage 2N - n - 1.
     weights = list(forward_weights) + list(reversed(backward_weights))
@@ -223,10 +217,17 @@ def _objective(
     fixed_bwd: Optional[Sequence[Number]],
 ) -> Tuple[float, float, float]:
     makespan = primitive_profile_guided_makespan(
-        B, N, J, t_split, fwd_per_layer, bwd_per_layer, fixed_fwd=fixed_fwd, fixed_bwd=fixed_bwd
+        B,
+        N,
+        J,
+        t_split,
+        fwd_per_layer[0],
+        bwd_per_layer[0],
+        fixed_fwd,
+        fixed_bwd,
     )
     forward, backward = primitive_weights_for_partition(
-        t_split, fwd_per_layer, bwd_per_layer, fixed_fwd=fixed_fwd, fixed_bwd=fixed_bwd
+        t_split, fwd_per_layer[0], bwd_per_layer[0], fixed_fwd, fixed_bwd
     )
     stage_totals = [fwd + bwd for fwd, bwd in zip(forward, backward)]
     return makespan, max(stage_totals), max(stage_totals) - min(stage_totals)
@@ -276,6 +277,30 @@ def _enumerate_partitions(total_layers, mins, maxes):
     yield from visit(0, total_layers)
 
 
+def _solve_with_exact_enumeration(
+    B,
+    N,
+    J,
+    total_layers,
+    fwd,
+    bwd,
+    fixed_forward,
+    fixed_backward,
+    mins,
+    maxes,
+):
+    best_split = None
+    best_score = None
+    for candidate in _enumerate_partitions(total_layers, mins, maxes):
+        score = _objective(B, N, J, candidate, fwd, bwd, fixed_forward, fixed_backward)
+        if best_score is None or score < best_score:
+            best_split = list(candidate)
+            best_score = score
+    if best_split is None or best_score is None:
+        raise RuntimeError("exact enumeration found no valid primitive partition")
+    return best_split, best_score, "exact_enumeration"
+
+
 def _greedy_seed(total_layers, fwd_per_layer, bwd_per_layer, mins, maxes):
     costs = [float(fwd) + float(bwd) for fwd, bwd in zip(fwd_per_layer, bwd_per_layer)]
     t_split = list(mins)
@@ -291,6 +316,114 @@ def _greedy_seed(total_layers, fwd_per_layer, bwd_per_layer, mins, maxes):
         stage = min(candidates, key=lambda idx: ((t_split[idx] + 1) * costs[idx], idx))
         t_split[stage] += 1
     return t_split
+
+
+def _scaled_int(value, scale):
+    return int(round(float(value) * scale))
+
+
+def _max_stage_weight_bound(total_layers, fwd, bwd, fixed_forward, fixed_backward, scale):
+    max_weight = 0
+    for stage in range(len(fwd)):
+        max_weight = max(
+            max_weight,
+            _scaled_int(fixed_forward[stage], scale)
+            + _scaled_int(fwd[stage], scale) * total_layers,
+            _scaled_int(fixed_backward[stage], scale)
+            + _scaled_int(bwd[stage], scale) * total_layers,
+        )
+    return max(1, max_weight)
+
+
+def _solve_with_cp_sat(
+    B,
+    N,
+    J,
+    total_layers,
+    fwd,
+    bwd,
+    fixed_forward,
+    fixed_backward,
+    mins,
+    maxes,
+):
+    try:
+        from ortools.sat.python import cp_model
+    except ImportError:
+        return None
+
+    scale = 1000
+    model = cp_model.CpModel()
+    layers = []
+    for stage in range(N):
+        upper = maxes[stage] if maxes[stage] is not None else total_layers
+        layers.append(model.NewIntVar(mins[stage], upper, f"layers_{stage}"))
+    model.Add(sum(layers) == total_layers)
+
+    fwd_weights = []
+    bwd_weights = []
+    max_weight = _max_stage_weight_bound(
+        total_layers, fwd, bwd, fixed_forward, fixed_backward, scale
+    )
+    for stage in range(N):
+        fwd_weight = model.NewIntVar(0, max_weight, f"fwd_weight_{stage}")
+        bwd_weight = model.NewIntVar(0, max_weight, f"bwd_weight_{stage}")
+        model.Add(
+            fwd_weight
+            == _scaled_int(fixed_forward[stage], scale)
+            + _scaled_int(fwd[stage], scale) * layers[stage]
+        )
+        model.Add(
+            bwd_weight
+            == _scaled_int(fixed_backward[stage], scale)
+            + _scaled_int(bwd[stage], scale) * layers[stage]
+        )
+        fwd_weights.append(fwd_weight)
+        bwd_weights.append(bwd_weight)
+
+    weights = list(fwd_weights) + list(reversed(bwd_weights))
+    num_ops = 2 * N
+    horizon = max_weight * max(1, B * num_ops + J + 1)
+    table = [
+        [model.NewIntVar(0, horizon, f"T_{microbatch}_{op}") for op in range(num_ops)]
+        for microbatch in range(B)
+    ]
+
+    for microbatch_id in range(B):
+        model.Add(table[microbatch_id][0] == (microbatch_id + 1) * weights[0])
+    for op_index in range(1, J):
+        model.Add(table[0][op_index] == sum(weights[: op_index + 1]))
+
+    for microbatch_id in range(B):
+        for op_index in range(num_ops):
+            if op_index == 0 or (microbatch_id == 0 and 1 <= op_index < J):
+                continue
+            dep_microbatch_id, dep_op_index = _get_prev_b_dependency(
+                microbatch_id, op_index, B, N, J
+            )
+            previous = table[microbatch_id][op_index - 1]
+            dependency = table[dep_microbatch_id][dep_op_index]
+            max_dependency = model.NewIntVar(0, horizon, f"maxdep_{microbatch_id}_{op_index}")
+            model.AddMaxEquality(max_dependency, [previous, dependency])
+            model.Add(table[microbatch_id][op_index] == max_dependency + weights[op_index])
+
+    makespan = model.NewIntVar(0, horizon, "makespan")
+    model.AddMaxEquality(
+        makespan, [table[microbatch_id][num_ops - 1] for microbatch_id in range(B)]
+    )
+    model.Minimize(makespan)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = 8
+    solver.parameters.max_time_in_seconds = 60.0
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError("OR-Tools CP-SAT could not find a primitive partition")
+
+    t_split = [solver.Value(var) for var in layers]
+    score = _objective(B, N, J, t_split, fwd, bwd, fixed_forward, fixed_backward)
+    search_method = "cp_sat" if status == cp_model.OPTIMAL else "cp_sat_feasible"
+    return t_split, score, search_method
 
 
 def _local_search(
@@ -340,10 +473,10 @@ def solve_primitive_profile_guided_partition(
     N,
     J,
     total_layers,
-    fwd_per_layer,
-    bwd_per_layer,
-    fixed_fwd=None,
-    fixed_bwd=None,
+    a_fwd,
+    a_bwd,
+    bias_fwd,
+    bias_bwd,
     min_layers_per_stage=1,
     max_layers_per_stage=None,
 ):
@@ -366,43 +499,53 @@ def solve_primitive_profile_guided_partition(
         N,
         J,
         total_layers,
-        fwd_per_layer,
-        bwd_per_layer,
-        fixed_fwd,
-        fixed_bwd,
+        a_fwd,
+        a_bwd,
+        bias_fwd,
+        bias_bwd,
         min_layers_per_stage,
         max_layers_per_stage,
     )
 
     search_space = _composition_count(total_layers, mins, maxes)
-    exhaustive_limit = 250_000
-    best_split = None
-    best_score = None
-
-    if search_space <= exhaustive_limit:
-        search_method = "exhaustive"
-        candidates = _enumerate_partitions(total_layers, mins, maxes)
-    else:
-        search_method = "greedy_local"
-        seed = _greedy_seed(total_layers, fwd, bwd, mins, maxes)
-        split, score = _local_search(
-            seed, B, N, J, fwd, bwd, fixed_forward, fixed_backward, mins, maxes
+    exact_enumeration_limit = 250_000
+    if search_space <= exact_enumeration_limit:
+        best_split, best_score, search_method = _solve_with_exact_enumeration(
+            B,
+            N,
+            J,
+            total_layers,
+            fwd,
+            bwd,
+            fixed_forward,
+            fixed_backward,
+            mins,
+            maxes,
         )
-        candidates = [split]
-        best_split = list(split)
-        best_score = score
-
-    for candidate in candidates:
-        score = _objective(B, N, J, candidate, fwd, bwd, fixed_forward, fixed_backward)
-        if best_score is None or score < best_score:
-            best_split = list(candidate)
-            best_score = score
-
-    if best_split is None or best_score is None:
-        raise RuntimeError("failed to find a valid primitive partition")
+    else:
+        cp_sat_solution = _solve_with_cp_sat(
+            B,
+            N,
+            J,
+            total_layers,
+            fwd,
+            bwd,
+            fixed_forward,
+            fixed_backward,
+            mins,
+            maxes,
+        )
+        if cp_sat_solution is not None:
+            best_split, best_score, search_method = cp_sat_solution
+        else:
+            search_method = "greedy_local"
+            seed = _greedy_seed(total_layers, fwd, bwd, mins, maxes)
+            best_split, best_score = _local_search(
+                seed, B, N, J, fwd, bwd, fixed_forward, fixed_backward, mins, maxes
+            )
 
     forward_weights, backward_weights = primitive_weights_for_partition(
-        best_split, fwd, bwd, fixed_fwd=fixed_forward, fixed_bwd=fixed_backward
+        best_split, fwd[0], bwd[0], fixed_forward, fixed_backward
     )
     return PrimitivePartitionSolution(
         t_split=best_split,
@@ -439,10 +582,10 @@ def main():
     parser.add_argument("--N", type=int, required=True)
     parser.add_argument("--J", type=int, required=True)
     parser.add_argument("--total-layers", type=int, required=True)
-    parser.add_argument("--fwd-per-layer", required=True)
-    parser.add_argument("--bwd-per-layer", required=True)
-    parser.add_argument("--fixed-fwd", default=None)
-    parser.add_argument("--fixed-bwd", default=None)
+    parser.add_argument("--a-fwd", type=float, required=True)
+    parser.add_argument("--a-bwd", type=float, required=True)
+    parser.add_argument("--bias-fwd", required=True)
+    parser.add_argument("--bias-bwd", required=True)
     parser.add_argument("--min-layers-per-stage", type=int, default=1)
     parser.add_argument("--max-layers-per-stage", type=int, default=None)
     parser.add_argument("--pp-size", type=int, default=None)
@@ -454,10 +597,10 @@ def main():
         N=args.N,
         J=args.J,
         total_layers=args.total_layers,
-        fwd_per_layer=_parse_csv_floats(args.fwd_per_layer),
-        bwd_per_layer=_parse_csv_floats(args.bwd_per_layer),
-        fixed_fwd=None if args.fixed_fwd is None else _parse_csv_floats(args.fixed_fwd),
-        fixed_bwd=None if args.fixed_bwd is None else _parse_csv_floats(args.fixed_bwd),
+        a_fwd=args.a_fwd,
+        a_bwd=args.a_bwd,
+        bias_fwd=_parse_csv_floats(args.bias_fwd),
+        bias_bwd=_parse_csv_floats(args.bias_bwd),
         min_layers_per_stage=args.min_layers_per_stage,
         max_layers_per_stage=args.max_layers_per_stage,
     )
