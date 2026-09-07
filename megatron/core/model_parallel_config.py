@@ -36,6 +36,12 @@ class ModelParallelConfig:
        arxiv.org/pdf/2104.04473.pdf for more details.
     """
 
+    pipeline_schedule: Literal["default", "slackpipe"] = "default"
+    """Selects the pipeline-parallel training schedule."""
+
+    slackpipe_plan: Optional[str] = None
+    """Path to a JSON SlackPipe plan. Required when pipeline_schedule is slackpipe."""
+
     sequence_parallel: bool = False
     """Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms
        and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer Models

@@ -6,18 +6,24 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -30,29 +36,22 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
-
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -409,8 +408,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -434,6 +434,18 @@ def validate_args(args, defaults={}):
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
+
+    if args.pipeline_schedule == 'slackpipe':
+        assert args.slackpipe_plan is not None, \
+            '--slackpipe-plan is required when --pipeline-schedule=slackpipe'
+        assert args.pipeline_model_parallel_size == 1, \
+            'SlackPipe prototype requires --pipeline-model-parallel-size=1'
+        assert args.tensor_model_parallel_size == 1, \
+            'SlackPipe prototype requires --tensor-model-parallel-size=1'
+        assert args.context_parallel_size == 1, \
+            'SlackPipe prototype requires --context-parallel-size=1'
+        assert args.data_parallel_size == 1, \
+            'SlackPipe prototype does not support data parallelism'
 
     if args.perform_rl_step:
         # ----------------------------------------------------------------
@@ -756,8 +768,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -977,7 +991,16 @@ def validate_args(args, defaults={}):
                     'Number of layers should be divisible by the pipeline-model-parallel size'
 
     if args.virtual_pipeline_model_parallel_size is not None:
-        if args.overlap_p2p_comm:
+        if args.pipeline_schedule == 'slackpipe':
+            assert args.pipeline_model_parallel_size == 1, (
+                'SlackPipe prototype only supports pipeline-model-parallel size 1'
+            )
+            assert args.pipeline_model_parallel_layout is not None, (
+                'SlackPipe VPP model chunking requires --pipeline-model-parallel-layout'
+            )
+            args.overlap_p2p_comm = False
+            args.align_param_gather = False
+        elif args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
                 'When interleaved schedule is used, pipeline-model-parallel size '\
                 'should be greater than 1'
@@ -2508,8 +2531,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2737,6 +2759,13 @@ def _add_distributed_args(parser):
                        'Replicated stages or layers can be described with multiplication. '
                        'Commas can be used cosmetically. '
                        'Default None is not using this argument to set the layout.'))
+    group.add_argument('--pipeline-schedule',
+                       type=str, default='default',
+                       choices=['default', 'slackpipe'],
+                       help='Pipeline-parallel schedule to use.')
+    group.add_argument('--slackpipe-plan',
+                       type=str, default=None,
+                       help='Path to a JSON SlackPipe schedule plan.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
@@ -3345,7 +3374,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False

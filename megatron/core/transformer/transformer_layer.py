@@ -52,7 +52,10 @@ def get_transformer_layer_offset(
 
     is_first_pp_stage = pp_rank == 0
 
-    if config.pipeline_model_parallel_size > 1:
+    if config.pipeline_model_parallel_size > 1 or (
+        getattr(config, "pipeline_schedule", "default") == "slackpipe"
+        and config.pipeline_model_parallel_layout
+    ):
 
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(

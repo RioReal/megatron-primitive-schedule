@@ -338,10 +338,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
+            virtual_pipeline_model_parallel_size = args.virtual_pipeline_model_parallel_size
+            if (
+                getattr(args, "pipeline_schedule", "default") == "slackpipe"
+                and args.pipeline_model_parallel_size == 1
+            ):
+                virtual_pipeline_model_parallel_size = None
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
-                args.virtual_pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
@@ -359,6 +365,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
             )
+            if (
+                getattr(args, "pipeline_schedule", "default") == "slackpipe"
+                and args.pipeline_model_parallel_size == 1
+            ):
+                mpu.set_virtual_pipeline_model_parallel_world_size(
+                    args.virtual_pipeline_model_parallel_size
+                )
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"

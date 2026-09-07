@@ -45,7 +45,12 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 Shape = Union[List[int], torch.Size]
 
 
-def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
+def get_forward_backward_func(
+    pp_size: Optional[int] = None,
+    vp_size: Optional[int] = None,
+    pipeline_schedule: str = "default",
+    slackpipe_plan_path: Optional[str] = None,
+):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
 
@@ -140,6 +145,16 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
             Otherwise, provided values are used as-is and None is treated as an explicit input.
 
     """
+    if pipeline_schedule == "slackpipe":
+        from megatron.core.pipeline_parallel.slackpipe.schedule import forward_backward_slackpipe
+
+        return partial(
+            forward_backward_slackpipe,
+            slackpipe_plan_path=slackpipe_plan_path,
+        )
+    if pipeline_schedule != "default":
+        raise ValueError(f"Unknown pipeline schedule: {pipeline_schedule}")
+
     if pp_size is None and vp_size is None:
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
