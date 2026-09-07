@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from .communication import SlackPipeCommunicator
 from .plan import SlackPipeOperation, SlackPipePlan, load_slackpipe_plan
 
 __all__ = [
     "SlackPipeOperation",
     "SlackPipePlan",
+    "SlackPipeCommunicator",
     "forward_backward_slackpipe",
     "load_slackpipe_plan",
 ]

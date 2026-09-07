@@ -3,9 +3,10 @@
 """JSON plan parsing and validation for SlackPipe schedules."""
 
 import json
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,11 @@ class SlackPipePlan:
         """Operations assigned to worker 0 for the PP=1 prototype."""
 
         return self.operations[0]
+
+    def worker_operations(self, worker: int) -> Tuple[SlackPipeOperation, ...]:
+        """Operations assigned to a physical pipeline worker."""
+
+        return self.operations[worker]
 
 
 def load_slackpipe_plan(
@@ -217,6 +223,100 @@ def _validate_operations(
     missing = sorted(expected_keys - set(seen))
     if missing:
         raise ValueError(f"SlackPipe plan is missing operations: {missing}")
+
+    _validate_fifo_microbatch_order(
+        operations,
+        num_microbatches=num_microbatches,
+        num_stages=num_stages,
+        stage_to_worker=stage_to_worker,
+    )
+    _validate_operation_dag(
+        operations,
+        num_microbatches=num_microbatches,
+        num_stages=num_stages,
+    )
+
+
+def _validate_fifo_microbatch_order(
+    operations: Tuple[Tuple[SlackPipeOperation, ...], ...],
+    *,
+    num_microbatches: int,
+    num_stages: int,
+    stage_to_worker: Tuple[int, ...],
+) -> None:
+    for stage in range(num_stages):
+        worker = stage_to_worker[stage]
+        for kind in ("F", "B"):
+            microbatches = [
+                op.microbatch
+                for op in operations[worker]
+                if op.kind == kind and op.stage == stage
+            ]
+            expected = list(range(num_microbatches))
+            if microbatches != expected:
+                raise ValueError(
+                    "SlackPipe plan violates FIFO microbatch order for "
+                    f"{kind} stage {stage}: {microbatches} != {expected}"
+                )
+
+
+def _validate_operation_dag(
+    operations: Tuple[Tuple[SlackPipeOperation, ...], ...],
+    *,
+    num_microbatches: int,
+    num_stages: int,
+) -> None:
+    nodes: Set[Tuple[str, int, int]] = {
+        (kind, microbatch, stage)
+        for kind in ("F", "B")
+        for microbatch in range(num_microbatches)
+        for stage in range(num_stages)
+    }
+    edges: Dict[Tuple[str, int, int], Set[Tuple[str, int, int]]] = {
+        node: set() for node in nodes
+    }
+
+    def add_edge(src: Tuple[str, int, int], dst: Tuple[str, int, int]) -> None:
+        edges[src].add(dst)
+
+    for microbatch in range(num_microbatches):
+        for stage in range(num_stages):
+            add_edge(("F", microbatch, stage), ("B", microbatch, stage))
+            if stage > 0:
+                add_edge(("F", microbatch, stage - 1), ("F", microbatch, stage))
+            if stage < num_stages - 1:
+                add_edge(("B", microbatch, stage + 1), ("B", microbatch, stage))
+
+    for microbatch in range(num_microbatches - 1):
+        for stage in range(num_stages):
+            add_edge(("F", microbatch, stage), ("F", microbatch + 1, stage))
+            add_edge(("B", microbatch, stage), ("B", microbatch + 1, stage))
+
+    for worker_ops in operations:
+        for prev_op, next_op in zip(worker_ops, worker_ops[1:]):
+            add_edge(
+                (prev_op.kind, prev_op.microbatch, prev_op.stage),
+                (next_op.kind, next_op.microbatch, next_op.stage),
+            )
+
+    in_degree = {node: 0 for node in nodes}
+    for successors in edges.values():
+        for successor in successors:
+            in_degree[successor] += 1
+
+    ready = deque(node for node, degree in in_degree.items() if degree == 0)
+    visited = 0
+    while ready:
+        node = ready.popleft()
+        visited += 1
+        for successor in edges[node]:
+            in_degree[successor] -= 1
+            if in_degree[successor] == 0:
+                ready.append(successor)
+
+    if visited != len(nodes):
+        cyclic_nodes = sorted(node for node, degree in in_degree.items() if degree > 0)
+        raise ValueError(f"SlackPipe plan dependency graph contains a cycle: {cyclic_nodes}")
 
 
 def _require_int_sequence(value: object, field: str) -> Iterable[int]:

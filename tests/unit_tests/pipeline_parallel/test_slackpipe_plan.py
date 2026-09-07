@@ -136,3 +136,37 @@ def test_validate_cyclic_placement_rejects_non_cyclic_plan():
 
     with pytest.raises(ValueError, match="cyclic placement"):
         validate_cyclic_placement(plan)
+
+
+def test_plan_rejects_dependency_cycle():
+    payload = _valid_plan()
+    payload["operations"][0] = [
+        {"kind": "F", "microbatch": 0, "stage": 1},
+        {"kind": "F", "microbatch": 0, "stage": 0},
+        {"kind": "B", "microbatch": 0, "stage": 1},
+        {"kind": "B", "microbatch": 0, "stage": 0},
+        {"kind": "F", "microbatch": 1, "stage": 0},
+        {"kind": "F", "microbatch": 1, "stage": 1},
+        {"kind": "B", "microbatch": 1, "stage": 1},
+        {"kind": "B", "microbatch": 1, "stage": 0},
+    ]
+
+    with pytest.raises(ValueError, match="dependency graph contains a cycle"):
+        parse_slackpipe_plan(payload, pipeline_model_parallel_size=1)
+
+
+def test_plan_rejects_fifo_violation():
+    payload = _valid_plan()
+    payload["operations"][0] = [
+        {"kind": "F", "microbatch": 1, "stage": 0},
+        {"kind": "F", "microbatch": 0, "stage": 0},
+        {"kind": "F", "microbatch": 0, "stage": 1},
+        {"kind": "B", "microbatch": 0, "stage": 1},
+        {"kind": "B", "microbatch": 0, "stage": 0},
+        {"kind": "F", "microbatch": 1, "stage": 1},
+        {"kind": "B", "microbatch": 1, "stage": 1},
+        {"kind": "B", "microbatch": 1, "stage": 0},
+    ]
+
+    with pytest.raises(ValueError, match="violates FIFO microbatch order"):
+        parse_slackpipe_plan(payload, pipeline_model_parallel_size=1)

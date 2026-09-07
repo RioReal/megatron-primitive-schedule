@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION. All rights reserved.
 
 import json
+import os
 import re
 from types import SimpleNamespace
 
@@ -19,11 +20,13 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 NUM_LAYERS = 8
 SLACKPIPE_LAYOUT = "Et|t*2|t|t*4L"
 SLACKPIPE_SPLIT = [1, 2, 1, 4]
+SLACKPIPE_PP2_LAYOUT = "Et|t*2|t*2|t*3L"
+SLACKPIPE_PP2_SPLIT = [1, 2, 2, 3]
 
 
 def _set_minimal_training_args(**overrides):
@@ -92,6 +95,9 @@ def _gpt_local_model_provider(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_slackpipe_pp1_constructs_logical_vpp_chunks():
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("run PP=1 SlackPipe construction test without torchrun")
+
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     parallel_state.set_virtual_pipeline_model_parallel_world_size(4)
     _set_minimal_training_args()
@@ -150,9 +156,35 @@ def _make_equivalence_config(pipeline_schedule="default", vpp=None, layout=None)
     )
 
 
-def _build_model(config, pipeline_schedule="default", vpp=None, layout=None, provider=None):
+def _make_pp2_equivalence_config(pipeline_schedule="default"):
+    return TransformerConfig(
+        num_layers=NUM_LAYERS,
+        hidden_size=64,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        pipeline_model_parallel_layout=SLACKPIPE_PP2_LAYOUT,
+        pipeline_schedule=pipeline_schedule,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        batch_p2p_comm=True,
+        overlap_p2p_comm=False,
+    )
+
+
+def _build_model(
+    config,
+    pipeline_schedule="default",
+    pp_size=1,
+    vpp=None,
+    layout=None,
+    provider=None,
+):
     _set_minimal_training_args(
         pipeline_schedule=pipeline_schedule,
+        pipeline_model_parallel_size=pp_size,
         virtual_pipeline_model_parallel_size=vpp,
         pipeline_model_parallel_layout=layout,
     )
@@ -225,6 +257,41 @@ def _write_slackpipe_plan(path):
     )
 
 
+def _write_slackpipe_pp2_plan(path):
+    worker_operations = [[], []]
+    for microbatch in range(4):
+        worker_operations[0].extend(
+            [
+                {"kind": "F", "microbatch": microbatch, "stage": 0},
+                {"kind": "F", "microbatch": microbatch, "stage": 2},
+                {"kind": "B", "microbatch": microbatch, "stage": 2},
+                {"kind": "B", "microbatch": microbatch, "stage": 0},
+            ]
+        )
+        worker_operations[1].extend(
+            [
+                {"kind": "F", "microbatch": microbatch, "stage": 1},
+                {"kind": "F", "microbatch": microbatch, "stage": 3},
+                {"kind": "B", "microbatch": microbatch, "stage": 3},
+                {"kind": "B", "microbatch": microbatch, "stage": 1},
+            ]
+        )
+    path.write_text(
+        json.dumps(
+            {
+                "num_microbatches": 4,
+                "num_stages": 4,
+                "num_workers": 2,
+                "num_layers": NUM_LAYERS,
+                "layer_split": SLACKPIPE_PP2_SPLIT,
+                "stage_to_worker": [0, 1, 0, 1],
+                "operations": worker_operations,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _logical_named_parameters(model):
     chunks = model if isinstance(model, list) else [model]
     logical_params = {}
@@ -261,8 +328,23 @@ def _max_abs_gradient_diff(left, right):
     return max_diff
 
 
+def _copy_parameters(source, destination):
+    assert set(destination).issubset(set(source))
+    for name, param in destination.items():
+        param.data.copy_(source[name].data)
+
+
+def _max_abs_distributed(value):
+    tensor = torch.tensor([value], dtype=torch.float32, device="cuda")
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return tensor.item()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_slackpipe_pp1_numerical_equivalence(tmp_path):
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("run PP=1 SlackPipe equivalence test without torchrun")
+
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
@@ -337,3 +419,105 @@ def test_slackpipe_pp1_numerical_equivalence(tmp_path):
 
     Utils.destroy_model_parallel()
     parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_slackpipe_pp2_numerical_equivalence(tmp_path):
+    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+        pytest.skip("run with torchrun --nproc-per-node 2")
+
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    clear_nvte_env_vars()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    baseline_model = _build_model(_make_equivalence_config(), provider=_gpt_local_model_provider)
+    baseline_params = _logical_named_parameters(baseline_model)
+    baseline_optimizer = torch.optim.SGD(baseline_params.values(), lr=0.01)
+    baseline_optimizer.zero_grad(set_to_none=True)
+    batches = _make_batches()
+    baseline_losses = []
+    baseline_module = baseline_model[0] if isinstance(baseline_model, list) else baseline_model
+    for batch in batches:
+        output_tensor = baseline_module(
+            batch["tokens"],
+            batch["position_ids"],
+            None,
+            labels=batch["labels"],
+        )
+        loss = output_tensor.float().mean()
+        baseline_losses.append({"loss": (loss / 4).detach()})
+        (loss / 4).backward()
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+    )
+
+    try:
+        slackpipe_model = _build_model(
+            _make_pp2_equivalence_config("slackpipe"),
+            pipeline_schedule="slackpipe",
+            pp_size=2,
+            vpp=2,
+            layout=SLACKPIPE_PP2_LAYOUT,
+            provider=_gpt_local_model_provider,
+        )
+
+        slackpipe_params = _logical_named_parameters(slackpipe_model)
+        _copy_parameters(baseline_params, slackpipe_params)
+        baseline_subset = {name: baseline_params[name] for name in slackpipe_params}
+        initial_param_diff = _max_abs_parameter_diff(baseline_subset, slackpipe_params)
+        slackpipe_optimizer = torch.optim.SGD(slackpipe_params.values(), lr=0.01)
+        slackpipe_optimizer.zero_grad(set_to_none=True)
+
+        plan_path = tmp_path / "slackpipe_pp2_plan.json"
+        _write_slackpipe_pp2_plan(plan_path)
+        slackpipe_losses = get_forward_backward_func(
+            pipeline_schedule="slackpipe",
+            slackpipe_plan_path=str(plan_path),
+        )(
+            forward_step_func=_forward_step_func,
+            data_iterator=[_batch_iterator(batches) for _ in range(2)],
+            model=slackpipe_model,
+            num_microbatches=4,
+            seq_length=8,
+            micro_batch_size=1,
+            forward_only=False,
+        )
+
+        local_loss_diff = 0.0
+        if slackpipe_losses:
+            assert len(baseline_losses) == len(slackpipe_losses)
+            local_loss_diff = max(
+                (baseline_loss["loss"] - slackpipe_loss["loss"]).abs().max().item()
+                for baseline_loss, slackpipe_loss in zip(baseline_losses, slackpipe_losses)
+            )
+        loss_diff = _max_abs_distributed(local_loss_diff)
+        grad_diff = _max_abs_distributed(
+            _max_abs_gradient_diff(baseline_subset, slackpipe_params)
+        )
+
+        baseline_optimizer.step()
+        slackpipe_optimizer.step()
+        post_step_param_diff = _max_abs_distributed(
+            _max_abs_parameter_diff(baseline_subset, slackpipe_params)
+        )
+        initial_param_diff = _max_abs_distributed(initial_param_diff)
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                "SlackPipe PP=2 equivalence max abs diffs: "
+                f"initial_params={initial_param_diff:.8e}, "
+                f"loss={loss_diff:.8e}, "
+                f"grads={grad_diff:.8e}, "
+                f"post_step_params={post_step_param_diff:.8e}"
+            )
+
+        assert initial_param_diff == 0.0
+        assert loss_diff == 0.0
+        assert grad_diff == 0.0
+        assert post_step_param_diff == 0.0
+    finally:
+        parallel_state.destroy_model_parallel()
+        Utils.inited = False
+        parallel_state.set_virtual_pipeline_model_parallel_world_size(None)

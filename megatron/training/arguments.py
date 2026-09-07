@@ -438,8 +438,8 @@ def validate_args(args, defaults={}):
     if args.pipeline_schedule == 'slackpipe':
         assert args.slackpipe_plan is not None, \
             '--slackpipe-plan is required when --pipeline-schedule=slackpipe'
-        assert args.pipeline_model_parallel_size == 1, \
-            'SlackPipe prototype requires --pipeline-model-parallel-size=1'
+        assert args.pipeline_model_parallel_size in (1, 2), \
+            'SlackPipe prototype requires --pipeline-model-parallel-size=1 or 2'
         assert args.tensor_model_parallel_size == 1, \
             'SlackPipe prototype requires --tensor-model-parallel-size=1'
         assert args.context_parallel_size == 1, \
@@ -992,8 +992,8 @@ def validate_args(args, defaults={}):
 
     if args.virtual_pipeline_model_parallel_size is not None:
         if args.pipeline_schedule == 'slackpipe':
-            assert args.pipeline_model_parallel_size == 1, (
-                'SlackPipe prototype only supports pipeline-model-parallel size 1'
+            assert args.pipeline_model_parallel_size in (1, 2), (
+                'SlackPipe prototype only supports pipeline-model-parallel size 1 or 2'
             )
             assert args.pipeline_model_parallel_layout is not None, (
                 'SlackPipe VPP model chunking requires --pipeline-model-parallel-layout'
