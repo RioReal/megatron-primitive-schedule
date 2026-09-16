@@ -42,6 +42,9 @@ class ModelParallelConfig:
     slackpipe_plan: Optional[str] = None
     """Path to a JSON SlackPipe plan. Required when pipeline_schedule is slackpipe."""
 
+    slackpipe_trace: Optional[str] = None
+    """Optional path for per-rank SlackPipe execution trace JSON."""
+
     sequence_parallel: bool = False
     """Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms
        and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer Models

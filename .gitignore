@@ -25,3 +25,15 @@ docs/apidocs
 # Git worktrees
 .worktrees/
 .claude/worktrees/
+
+# Separate SlackPipe solver checkout (not an outer-repository submodule).
+/slackpipe/
+
+# Local SlackPipe outputs; reusable runtime, tests, and tools remain visible.
+/slackpipe_plans/
+/slackpipe_profiles/
+/slackpipe_experiments*/
+/slackpipe_traces/
+.pytest_cache/
+*.nsys-rep
+*.ncu-rep

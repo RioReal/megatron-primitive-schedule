@@ -278,6 +278,9 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 
 def destroy_global_state():
+    from megatron.core.pipeline_parallel.slackpipe.schedule import clear_slackpipe_runtime_cache
+
+    clear_slackpipe_runtime_cache()
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
@@ -3292,6 +3295,11 @@ def train(
     forward_backward_func = get_forward_backward_func(
         pipeline_schedule=args.pipeline_schedule,
         slackpipe_plan_path=args.slackpipe_plan,
+        slackpipe_trace_path=getattr(args, "slackpipe_trace", None),
+        slackpipe_profile_path=getattr(args, "slackpipe_profile", None),
+        slackpipe_runtime=getattr(args, "slackpipe_runtime", "debug"),
+        slackpipe_transport=getattr(args, "slackpipe_transport", "nccl-p2p"),
+        slackpipe_enable_nvtx=not getattr(args, "slackpipe_disable_nvtx", False),
     )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
@@ -3860,6 +3868,11 @@ def evaluate(
     forward_backward_func = get_forward_backward_func(
         pipeline_schedule=args.pipeline_schedule,
         slackpipe_plan_path=args.slackpipe_plan,
+        slackpipe_trace_path=getattr(args, "slackpipe_trace", None),
+        slackpipe_profile_path=getattr(args, "slackpipe_profile", None),
+        slackpipe_runtime=getattr(args, "slackpipe_runtime", "debug"),
+        slackpipe_transport=getattr(args, "slackpipe_transport", "nccl-p2p"),
+        slackpipe_enable_nvtx=not getattr(args, "slackpipe_disable_nvtx", False),
     )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(

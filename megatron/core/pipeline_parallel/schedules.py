@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import time
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -43,6 +44,65 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
+_SLACKPIPE_COST_CALIBRATION_EVENTS = None
+_SLACKPIPE_COST_CALIBRATION_ITERATION = None
+
+
+def begin_slackpipe_cost_calibration_iteration(iteration: int) -> None:
+    """Enable synchronized compute-only calibration for one schedule iteration."""
+
+    global _SLACKPIPE_COST_CALIBRATION_EVENTS
+    global _SLACKPIPE_COST_CALIBRATION_ITERATION
+    _SLACKPIPE_COST_CALIBRATION_EVENTS = []
+    _SLACKPIPE_COST_CALIBRATION_ITERATION = iteration
+
+
+def end_slackpipe_cost_calibration_iteration() -> List[Dict[str, object]]:
+    """Disable calibration and return events collected on this rank."""
+
+    global _SLACKPIPE_COST_CALIBRATION_EVENTS
+    global _SLACKPIPE_COST_CALIBRATION_ITERATION
+    events = _SLACKPIPE_COST_CALIBRATION_EVENTS or []
+    _SLACKPIPE_COST_CALIBRATION_EVENTS = None
+    _SLACKPIPE_COST_CALIBRATION_ITERATION = None
+    return events
+
+
+def _run_with_slackpipe_cost_calibration(
+    *,
+    phase: str,
+    microbatch: Optional[int],
+    model_chunk_id: int,
+    compute,
+):
+    if _SLACKPIPE_COST_CALIBRATION_EVENTS is None:
+        return compute()
+
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    result = compute()
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+    end = time.perf_counter()
+
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+    logical_stage = model_chunk_id * pp_size + pp_rank
+    _SLACKPIPE_COST_CALIBRATION_EVENTS.append(
+        {
+            "iteration": _SLACKPIPE_COST_CALIBRATION_ITERATION,
+            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+            "pp_rank": pp_rank,
+            "vp_rank": model_chunk_id,
+            "model_chunk_id": model_chunk_id,
+            "logical_stage": logical_stage,
+            "microbatch": microbatch,
+            "phase": phase,
+            "elapsed_ms": (end - start) * 1000.0,
+        }
+    )
+    return result
 
 
 def get_forward_backward_func(
@@ -50,6 +110,11 @@ def get_forward_backward_func(
     vp_size: Optional[int] = None,
     pipeline_schedule: str = "default",
     slackpipe_plan_path: Optional[str] = None,
+    slackpipe_trace_path: Optional[str] = None,
+    slackpipe_profile_path: Optional[str] = None,
+    slackpipe_runtime: str = "debug",
+    slackpipe_enable_nvtx: bool = True,
+    slackpipe_transport: str = "nccl-p2p",
 ):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -151,6 +216,11 @@ def get_forward_backward_func(
         return partial(
             forward_backward_slackpipe,
             slackpipe_plan_path=slackpipe_plan_path,
+            slackpipe_trace_path=slackpipe_trace_path,
+            slackpipe_profile_path=slackpipe_profile_path,
+            slackpipe_runtime=slackpipe_runtime,
+            slackpipe_enable_nvtx=slackpipe_enable_nvtx,
+            slackpipe_transport=slackpipe_transport,
         )
     if pipeline_schedule != "default":
         raise ValueError(f"Unknown pipeline schedule: {pipeline_schedule}")
@@ -1173,7 +1243,6 @@ def forward_backward_pipelining_with_interleaving(
 
     def get_microbatch_id_in_model_chunk(iteration_id, forward):
         """Helper method to get the microbatch_id within model chunk given the iteration number."""
-        assert forward
         microbatch_id_in_model_chunk = microbatch_id_table[iteration_id]
         return microbatch_id_in_model_chunk
 
@@ -1314,25 +1383,31 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id, microbatch_id
         )
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator[model_chunk_id],
-            model[model_chunk_id],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step,
-                forward_only,
-                is_first_microbatch_for_model_chunk(virtual_microbatch_id),
+        output_tensor, num_tokens = _run_with_slackpipe_cost_calibration(
+            phase="forward_compute",
+            microbatch=microbatch_id,
+            model_chunk_id=model_chunk_id,
+            compute=lambda: forward_step(
+                forward_step_func,
+                data_iterator[model_chunk_id],
+                model[model_chunk_id],
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step,
+                    forward_only,
+                    is_first_microbatch_for_model_chunk(virtual_microbatch_id),
+                ),
+                current_microbatch=microbatch_id,
+                vp_stage=model_chunk_id,
+                is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id)
+                and is_pp_last_stage(pp_group),
             ),
-            current_microbatch=microbatch_id,
-            vp_stage=model_chunk_id,
-            is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group),
         )
 
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
@@ -1382,12 +1457,18 @@ def forward_backward_pipelining_with_interleaving(
         """Helper method to run backward step with model split into chunks"""
         nonlocal output_tensor_grads
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=False)
 
         input_tensor, output_tensor, output_tensor_grad = backward_step_helper_preprocess(
             virtual_microbatch_id, model_chunk_id
         )
 
-        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        input_tensor_grad = _run_with_slackpipe_cost_calibration(
+            phase="backward_compute",
+            microbatch=microbatch_id,
+            model_chunk_id=model_chunk_id,
+            compute=lambda: backward_step(input_tensor, output_tensor, output_tensor_grad, config),
+        )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 

@@ -395,6 +395,49 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def _configure_slackpipe_plan_args(args):
+    """Derive Megatron PP layout arguments from the SlackPipe plan."""
+
+    if args.pipeline_schedule != 'slackpipe':
+        return
+
+    from megatron.core.pipeline_parallel.slackpipe.plan import (
+        derive_pipeline_model_parallel_layout,
+        load_slackpipe_plan,
+        validate_plan_parallel_layout,
+    )
+
+    assert args.slackpipe_plan is not None, \
+        '--slackpipe-plan is required when --pipeline-schedule=slackpipe'
+    plan = load_slackpipe_plan(
+        args.slackpipe_plan,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+    )
+    assert args.num_layers is None or args.num_layers == plan.num_layers, (
+        f"SlackPipe plan num_layers must match --num-layers "
+        f"({plan.num_layers} != {args.num_layers})"
+    )
+
+    virtual_pipeline_model_parallel_size = validate_plan_parallel_layout(
+        plan, args.pipeline_model_parallel_size
+    )
+    derived_layout = derive_pipeline_model_parallel_layout(plan)
+    explicit_layout = args.pipeline_model_parallel_layout
+    assert explicit_layout is None or explicit_layout == derived_layout, (
+        "SlackPipe --pipeline-model-parallel-layout must match the layout derived from "
+        f"--slackpipe-plan ({explicit_layout!r} != {derived_layout!r})"
+    )
+    args.pipeline_model_parallel_layout = derived_layout
+    args.virtual_pipeline_model_parallel_size = (
+        virtual_pipeline_model_parallel_size
+        if virtual_pipeline_model_parallel_size > 1
+        else None
+    )
+    args.overlap_p2p_comm = False
+    args.align_param_gather = False
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -436,8 +479,6 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.pipeline_schedule == 'slackpipe':
-        assert args.slackpipe_plan is not None, \
-            '--slackpipe-plan is required when --pipeline-schedule=slackpipe'
         assert args.pipeline_model_parallel_size in (1, 2), \
             'SlackPipe prototype requires --pipeline-model-parallel-size=1 or 2'
         assert args.tensor_model_parallel_size == 1, \
@@ -446,6 +487,7 @@ def validate_args(args, defaults={}):
             'SlackPipe prototype requires --context-parallel-size=1'
         assert args.data_parallel_size == 1, \
             'SlackPipe prototype does not support data parallelism'
+        _configure_slackpipe_plan_args(args)
 
     if args.perform_rl_step:
         # ----------------------------------------------------------------
@@ -994,9 +1036,6 @@ def validate_args(args, defaults={}):
         if args.pipeline_schedule == 'slackpipe':
             assert args.pipeline_model_parallel_size in (1, 2), (
                 'SlackPipe prototype only supports pipeline-model-parallel size 1 or 2'
-            )
-            assert args.pipeline_model_parallel_layout is not None, (
-                'SlackPipe VPP model chunking requires --pipeline-model-parallel-layout'
             )
             args.overlap_p2p_comm = False
             args.align_param_gather = False
@@ -2766,6 +2805,22 @@ def _add_distributed_args(parser):
     group.add_argument('--slackpipe-plan',
                        type=str, default=None,
                        help='Path to a JSON SlackPipe schedule plan.')
+    group.add_argument('--slackpipe-transport', choices=['nccl-p2p', 'nccl-rma'],
+                       default='nccl-p2p', help='SlackPipe remote tensor transport.')
+    group.add_argument('--slackpipe-trace',
+                       type=str, default=None,
+                       help='Optional path for per-rank SlackPipe execution trace JSON.')
+    group.add_argument('--slackpipe-profile',
+                       type=str, default=None,
+                       help='Optional path for per-rank SlackPipe profile JSON.')
+    group.add_argument('--slackpipe-runtime',
+                       type=str, default='debug',
+                       choices=['debug', 'fast'],
+                       help='SlackPipe execution runtime. Debug keeps extra validation; fast caches '
+                       'plan and communicator state for benchmarking.')
+    group.add_argument('--slackpipe-disable-nvtx',
+                       action='store_true',
+                       help='Disable SlackPipe per-operation NVTX ranges.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

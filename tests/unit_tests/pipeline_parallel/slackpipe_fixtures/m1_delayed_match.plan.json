@@ -1,0 +1,366 @@
+{
+  "schema_version": "slackpipe.plan.v1",
+  "num_microbatches": 8,
+  "num_stages": 4,
+  "num_workers": 2,
+  "num_layers": 16,
+  "layer_split": [
+    1,
+    7,
+    7,
+    1
+  ],
+  "stage_to_worker": [
+    0,
+    1,
+    0,
+    1
+  ],
+  "operations": [
+    [
+      {
+        "kind": "F",
+        "microbatch": 0,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 1,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 2,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 3,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 4,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 5,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 6,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 7,
+        "stage": 0
+      },
+      {
+        "kind": "F",
+        "microbatch": 0,
+        "stage": 2
+      },
+      {
+        "kind": "F",
+        "microbatch": 1,
+        "stage": 2
+      },
+      {
+        "kind": "F",
+        "microbatch": 2,
+        "stage": 2
+      },
+      {
+        "kind": "F",
+        "microbatch": 3,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 0,
+        "stage": 2
+      },
+      {
+        "kind": "F",
+        "microbatch": 4,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 1,
+        "stage": 2
+      },
+      {
+        "kind": "F",
+        "microbatch": 5,
+        "stage": 2
+      },
+      {
+        "kind": "F",
+        "microbatch": 6,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 2,
+        "stage": 2
+      },
+      {
+        "kind": "F",
+        "microbatch": 7,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 3,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 4,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 5,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 6,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 7,
+        "stage": 2
+      },
+      {
+        "kind": "B",
+        "microbatch": 0,
+        "stage": 0
+      },
+      {
+        "kind": "B",
+        "microbatch": 1,
+        "stage": 0
+      },
+      {
+        "kind": "B",
+        "microbatch": 2,
+        "stage": 0
+      },
+      {
+        "kind": "B",
+        "microbatch": 3,
+        "stage": 0
+      },
+      {
+        "kind": "B",
+        "microbatch": 4,
+        "stage": 0
+      },
+      {
+        "kind": "B",
+        "microbatch": 5,
+        "stage": 0
+      },
+      {
+        "kind": "B",
+        "microbatch": 6,
+        "stage": 0
+      },
+      {
+        "kind": "B",
+        "microbatch": 7,
+        "stage": 0
+      }
+    ],
+    [
+      {
+        "kind": "F",
+        "microbatch": 0,
+        "stage": 1
+      },
+      {
+        "kind": "F",
+        "microbatch": 1,
+        "stage": 1
+      },
+      {
+        "kind": "F",
+        "microbatch": 0,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 0,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 2,
+        "stage": 1
+      },
+      {
+        "kind": "F",
+        "microbatch": 3,
+        "stage": 1
+      },
+      {
+        "kind": "F",
+        "microbatch": 1,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 2,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 4,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 1,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 5,
+        "stage": 1
+      },
+      {
+        "kind": "F",
+        "microbatch": 6,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 0,
+        "stage": 1
+      },
+      {
+        "kind": "F",
+        "microbatch": 3,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 1,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 2,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 4,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 3,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 7,
+        "stage": 1
+      },
+      {
+        "kind": "F",
+        "microbatch": 5,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 6,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 4,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 2,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 5,
+        "stage": 3
+      },
+      {
+        "kind": "F",
+        "microbatch": 7,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 6,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 7,
+        "stage": 3
+      },
+      {
+        "kind": "B",
+        "microbatch": 3,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 4,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 5,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 6,
+        "stage": 1
+      },
+      {
+        "kind": "B",
+        "microbatch": 7,
+        "stage": 1
+      }
+    ]
+  ],
+  "solver_status": "FEASIBLE",
+  "predicted_makespan": 176339,
+  "cost_model": {
+    "kind": "cost_profile",
+    "schema_version": "slackpipe.cost_profile.v1",
+    "path": "/workspace/Megatron-LM/slackpipe_experiments_smoke/S_b8_seq64/cost_profiles/M1_global_ratio.cost_profile.json",
+    "units": "microseconds",
+    "tick_scale": "microseconds"
+  },
+  "forward_costs": [
+    1000,
+    7000,
+    7000,
+    1000
+  ],
+  "backward_costs": [
+    1709,
+    11963,
+    11963,
+    1709
+  ]
+}
