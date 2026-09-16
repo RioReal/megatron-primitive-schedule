@@ -26,8 +26,17 @@ docs/apidocs
 .worktrees/
 .claude/worktrees/
 
-# Separate SlackPipe solver checkout (not an outer-repository submodule).
-/slackpipe/
+# Solver source is part of the monorepo; only local outputs are excluded.
+/slackpipe/build/
+/slackpipe/.venv/
+/slackpipe/node_modules/
+/slackpipe/results/
+/slackpipe/eval_checkouts/
+/slackpipe/manifests/*.jsonl
+/slackpipe/manifests/*.metadata.json
+/slackpipe/paper/*.pdf
+/slackpipe/paper/figures/*.pdf
+/slackpipe/paper/tables/table_cal*.tex
 
 # Local SlackPipe outputs; reusable runtime, tests, and tools remain visible.
 /slackpipe_plans/

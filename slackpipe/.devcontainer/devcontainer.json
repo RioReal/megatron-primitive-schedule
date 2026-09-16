@@ -1,0 +1,21 @@
+{
+  "name": "SlackPipe C++ optimizer",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ],
+
+      "settings": {
+        "cmake.sourceDirectory": "${workspaceFolder}/slackpipe",
+        "cmake.generator": "Ninja",
+        "C_Cpp.default.cppStandard": "c++20"
+      }
+    }
+  }
+}

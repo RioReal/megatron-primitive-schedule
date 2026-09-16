@@ -27,8 +27,8 @@ The example plan/model and recorded outputs below are generated artifacts, not
 included in Git. To prepare new inputs, follow the top-level README calibration
 and solver workflow with hidden size 512, 16 heads, sequence length 256, and
 learning rate 1e-9, then pass the resulting plan/model paths to this driver.
-The optimized split may differ on another run or machine. The external solver
-and its dependencies must be obtained separately.
+The optimized split may differ on another run or machine. Build the optimizer
+in `slackpipe/` with its external OR-Tools dependencies as described in README.
 
 From the repository root, run each capture separately (substitute `slackpipe`
 for both occurrences of `baseline` in the second run):

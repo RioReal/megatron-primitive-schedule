@@ -999,15 +999,11 @@ def main() -> None:
     if not configs:
         raise SystemExit("no configurations selected")
 
-    run(["git", "rev-parse", "HEAD"], log_path=args.output_dir / "logs" / "outer_commit.log")
-    run(["git", "status", "--short"], log_path=args.output_dir / "logs" / "outer_status.log")
+    run(["git", "rev-parse", "HEAD"], log_path=args.output_dir / "logs" / "monorepo_commit.log")
+    run(["git", "status", "--short"], log_path=args.output_dir / "logs" / "monorepo_status.log")
     run(
-        ["git", "-C", "slackpipe", "rev-parse", "HEAD"],
-        log_path=args.output_dir / "logs" / "nested_commit.log",
-    )
-    run(
-        ["git", "-C", "slackpipe", "status", "--short"],
-        log_path=args.output_dir / "logs" / "nested_status.log",
+        ["git", "status", "--short", "--", "slackpipe"],
+        log_path=args.output_dir / "logs" / "solver_status.log",
     )
 
     build_solver(args.force, args.output_dir)

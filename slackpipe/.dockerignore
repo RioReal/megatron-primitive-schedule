@@ -1,0 +1,12 @@
+.git
+build
+.venv
+node_modules
+results
+eval_checkouts
+**/__pycache__
+**/.pytest_cache
+manifests
+paper/*.pdf
+paper/figures
+paper/tables

@@ -24,7 +24,7 @@ Upstream attribution, documentation, and installation guidance are preserved bel
 SlackPipe connects offline pipeline partition/schedule optimization to execution:
 
 ```text
-ordinary Megatron calibration -> cost profile -> C++ SlackPipe solver
+ordinary Megatron calibration -> cost profile -> ./slackpipe C++ CP-SAT optimizer
     -> slackpipe.plan -> Megatron SlackPipe execution
 ```
 
@@ -52,7 +52,7 @@ and PP=2 tests compare loss, every logical parameter gradient, and post-SGD
 parameters against ordinary Megatron; supported tested cases have matched exactly.
 This is a research checkpoint, not a claim of validation for arbitrary models.
 
-### Repository layout and separate solver
+### Monorepo layout
 
 | Path | Purpose |
 | --- | --- |
@@ -63,16 +63,50 @@ This is a research checkpoint, not a claim of validation for arbitrary models.
 | `tools/slackpipe_heterogeneous_experiment.py` | Heterogeneous class/range calibration |
 | `tools/slackpipe_plot_experiments.py` | Experiment plotting |
 | `tools/capture_schedule_trace.py`, `tools/plot_schedule_trace.py` | Opt-in profiler capture and schedule figures |
-| `slackpipe/` | **External, independent C++ solver Git checkout; not included in this repository** |
+| `slackpipe/` | C++ CP-SAT optimizer, DAG evaluator, plan exporter, tests, and evaluation tools |
 
-Obtain the solver repository URL from its maintainer and check it out at the
-repository root with `git clone <solver-repository-url> slackpipe`. It is not a
-submodule and is deliberately ignored by the outer repository. The local solver
-checkpoint is `415ae8da60ede4aa69c5703cbecb6dafabec040b` (plan exporter), **plus
-unpublished working-tree changes** for calibrated/v2 range-cost support. That
-commit alone is not sufficient to reproduce the complete current solver flow.
-The solver needs separate publication; no solver source or build products are
-bundled here. Existing plans can be consumed without installing OR-Tools.
+The runtime and optimizer are now published together. `slackpipe/` is a normal
+tracked directory, not a nested repository or submodule. It imports solver
+checkpoint `415ae8da60ede4aa69c5703cbecb6dafabec040b` and the calibrated/v2
+range-cost work required by this runtime. Build products, dependencies, and
+generated results remain excluded. Existing plans can be consumed without
+installing OR-Tools. See the [solver guide](slackpipe/README.md) and
+[import scope](slackpipe/docs/monorepo.md).
+
+### Build the optimizer
+
+CMake >=3.24, a C++20 compiler, and Ninja are required for these commands. No
+new build system or host Megatron installation is needed. From the monorepo
+root, use the prepared development container:
+
+```bash
+docker exec -w /workspace/Megatron-LM slackpipe-dev \
+  cmake -S slackpipe -B slackpipe/build/no-or -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DSLACKPIPE_ENABLE_ORTOOLS=OFF
+docker exec -w /workspace/Megatron-LM slackpipe-dev \
+  cmake --build slackpipe/build/no-or -j2
+docker exec -w /workspace/Megatron-LM slackpipe-dev \
+  ctest --test-dir slackpipe/build/no-or --output-on-failure
+```
+
+This dependency-light build includes the deterministic baselines, evaluator,
+exporter, and tests; it does not run CP-SAT. The optional solver-only image can
+be built with `docker build -t slackpipe-cpp:local -f slackpipe/Dockerfile slackpipe`.
+For CP-SAT, use the established local OR-Tools image (or an equivalent environment
+providing the OR-Tools CMake package and shared libraries):
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/workspace/Megatron-LM" -w /workspace/Megatron-LM \
+  --entrypoint /bin/bash slackpipe-ortools-runtime:local -lc \
+  'BUILD_DIR="$PWD/slackpipe/build/release" BUILD_JOBS=2 \
+   SLACKPIPE_OR_TEST_FILTER=".*" bash slackpipe/scripts/validate_ortools_evaluation.sh'
+```
+
+The script configures OR-Tools ON with `ORTOOLS_PREFIX` (default `/opt/or-tools`),
+builds, checks capabilities, runs CTest, and exercises tiny validated CLI cases.
+OR-Tools and container images remain external system dependencies, not vendored
+binaries. The image name can be replaced by your locally provisioned equivalent.
 
 ### Schemas
 
@@ -144,22 +178,26 @@ docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. slackpipe-dev \
   --warmup-iterations 5 --iterations 10
 ```
 
-With the separately built solver available in the same environment, the current
-CLI accepts the measured profile and exports an evaluator-validated plan:
+Use the OR-enabled environment to export an evaluator-validated plan. The mounted
+checkout path is kept identical so the plan's cost-profile reference is also
+accessible to Megatron:
 
 ```bash
-docker exec -w /workspace/Megatron-LM slackpipe-dev mkdir -p slackpipe_plans
-docker exec -w /workspace/Megatron-LM slackpipe-dev \
-  ./slackpipe/build/ortools/slackpipe_cli \
-  --algorithm optimize-joint --B 4 --N 4 --J 2 --L 12 \
+docker exec --user "$(id -u):$(id -g)" -w /workspace/Megatron-LM \
+  slackpipe-dev mkdir -p slackpipe_plans
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/workspace/Megatron-LM" -w /workspace/Megatron-LM \
+  --entrypoint ./slackpipe/build/release/slackpipe_cli slackpipe-ortools-runtime:local \
+  --algorithm slackpipe --split-mode global --B 4 --N 4 --J 2 --L 12 \
   --cost-profile slackpipe_profiles/heterogeneous/cost_profile.json \
   --time-limit-seconds 60 --num-workers 1 --require-optimal false \
   --output-prefix slackpipe_plans/heterogeneous \
   --emit-plan slackpipe_plans/heterogeneous.plan.json
 ```
 
-The binary path and OR-Tools dependencies depend on the external solver build;
-they are not provisioned by this outer commit. The reusable homogeneous host
+This exports through the canonical SlackPipe predecessor-validation path;
+`--algorithm optimize-joint` selects the unrestricted joint solver directly.
+The reusable homogeneous host
 orchestrator supports `SLACKPIPE_REPO`, `SLACKPIPE_CONTAINER_REPO`,
 `SLACKPIPE_CONTAINER`, and `SLACKPIPE_ORTOOLS_IMAGE` overrides. Its default solver
 image is a local development image, not a public dependency supplied here.
@@ -208,8 +246,7 @@ reuse/teardown stress is available in `slackpipe_rma_lifecycle_stress.py` with
   guarantee progress for every solver order. Delayed-matching schedules are
   exercised with experimental RMA; validate a plan/transport pair before use.
 - Current heterogeneous construction is exercised through the supplied model
-  harness, not a universal model-provider adapter. Solver publication remains a
-  separate prerequisite for reproducing optimization, as noted above.
+  harness, not a universal model-provider adapter.
 
 ---
 

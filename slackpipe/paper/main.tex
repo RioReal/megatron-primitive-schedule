@@ -1,0 +1,122 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.72in]{geometry}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\newcommand{\ubf}{\texttt{uniform-\allowbreak{}breadth-\allowbreak{}first}}
+\newcommand{\pof}{\texttt{partition-\allowbreak{}only-\allowbreak{}fixed-\allowbreak{}order}}
+\newcommand{\sou}{\texttt{schedule-\allowbreak{}only-\allowbreak{}uniform}}
+\newcommand{\seq}{\texttt{sequential-\allowbreak{}partition-\allowbreak{}then-\allowbreak{}schedule}}
+\newcommand{\alt}{\texttt{alternating-\allowbreak{}partition-\allowbreak{}schedule}}
+\newcommand{\joint}{\texttt{joint-\allowbreak{}unrestricted-\allowbreak{}no-\allowbreak{}overlap}}
+\newcommand{\noop}{\texttt{NoOverlap}}
+\newcommand{\heavycase}{\texttt{W2\_\allowbreak{}N4\_\allowbreak{}B4\_\allowbreak{}L32\_\allowbreak{}comm-\allowbreak{}heavy}}
+\newcommand{\mainhash}{\texttt{50968370d9612a5a}\allowbreak{}\texttt{eceee891e1c25555}\allowbreak{}\texttt{be35677d4a6f3888}\allowbreak{}\texttt{4949de3d9096cce4}}
+\emergencystretch=2em
+
+\begin{document}
+
+% Historical result sets (not bundled; see ARTIFACTS.md):
+% Main: cal_main_71489e6_20260811T062130Z
+% Oracle: cal_oracle_340dbf9_20260811T073223Z
+
+\section{Evaluation}
+
+\paragraph{Experimental setup.}
+We evaluate SlackPipe on a controlled CAL benchmark suite with fixed micro-batch
+count $B$, logical stages $N$, physical workers $W$, and partitionable layers
+$L$.  Stages are mapped to workers cyclically.  Each layer has forward cost 1
+and backward cost 2.  Communication is modeled as a constant inter-worker delay
+with none, moderate, and heavy profiles; these experiments do not use an
+alpha--beta payload model.  Retained activation memory is measured in controlled
+\emph{linear-in-stage-layers} proxy units, not physical GPU bytes.  The main
+profile contains 2592 completed-valid rows from manifest hash
+\mainhash{}
+using OR-Tools 9.15.6755 with variable-demand activation-cap support.  All
+solver-backed rows use a 30 second limit, one solver thread, and three seeds;
+we aggregate by median over seeds and geometric mean over workloads.
+
+\paragraph{Baselines.}
+We compare six implemented methods:
+\ubf{}, \pof{}, \sou{}, \seq{}, \alt{}, and \joint{}.  The fixed evaluated baseline is a
+breadth-first worker-local order, not interleaved 1F1B.  The direct joint method
+optimizes partitioning and worker-local order with unrestricted CP-SAT
+\noop{}; predecessor-window restriction is not active in this run.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/fig_cal_normalized_makespan.pdf}
+  \caption{Normalized makespan for the completed main CAL profile.  Values are
+  normalized to uniform-breadth-first at each workload; lower is
+  better.}
+  \label{fig:cal-normalized-makespan}
+\end{figure}
+
+\paragraph{Main results.}
+Figure~\ref{fig:cal-normalized-makespan} summarizes the main profile.  In the
+uncapped setting, \joint{} reaches geometric mean
+normalized makespan 0.9448 across 81 workloads, a 1.058$\times$ improvement over
+\ubf{}.  It improves over
+\pof{}, \sou{}, \seq{}, and
+\alt{} by 1.013$\times$, 1.043$\times$,
+1.006$\times$, and 1.002$\times$, respectively.  Joint is the strict winner on
+20 workloads, tied for best on 32, and loses on 29; thus the result is a modest
+aggregate advantage, not a universal win.  The largest speedup over uniform is
+1.234$\times$ on \heavycase{}.
+
+\paragraph{Equal-memory results.}
+To separate scheduling gains from increased activation residency, we also run
+equal-memory rows using materialized caps derived from the uniform baseline.
+All 1296 equal-memory rows are eligible and report zero cap violations.  Under
+these caps, \joint{} has geometric mean normalized
+makespan 0.9854, a 1.015$\times$ improvement over uniform.  It is slightly
+better than \pof{} and
+\sou{}, with 1.002$\times$ and 1.007$\times$
+improvements, and essentially tied with the two staged joint baselines
+(0.999$\times$ versus both \seq{} and
+\alt{}).  Joint is strict-best on 13 workloads,
+tied-best on 46, and loses on 22.  Its largest equal-memory improvement over
+uniform is 1.179$\times$ on the same heavy-communication workload
+\heavycase{}.  In uncapped runs, joint uses more proxy
+activation than uniform on 47 of 81 workloads and less or equal on 34, with
+median peak ratio 1.0625 and maximum ratio 1.875.
+
+\begin{table}[t]
+  \centering
+  \caption{Main-profile validation and activation summary.}
+  \label{tab:cal-main-summary}
+  \small
+  \input{tables/table_cal_summary.tex}
+\end{table}
+
+\paragraph{Oracle check.}
+We separately run a four-row oracle profile on two small configurations using
+exhaustive \pof{} enumeration.  All four oracle
+rows complete valid and are proven optimal by exhaustive enumeration with zero
+gap.  Equal-memory oracle rows use exact cap-constrained enumeration, rejecting
+cap-violating candidates before objective comparison.  This is a fixed-order
+partition oracle only; it does not prove joint optimality for the larger main
+profile.
+
+\begin{table}[t]
+  \centering
+  \caption{Oracle-profile validation and proof summary.}
+  \label{tab:cal-oracle-summary}
+  \small
+  \input{tables/table_cal_oracle_summary.tex}
+\end{table}
+
+\paragraph{Limitations.}
+The evaluation uses a controlled constant-delay communication model and proxy
+activation units, so it should not be read as a physical cluster measurement or
+as a GPU-byte memory study.  The direct joint method uses unrestricted
+\noop{}; predecessor-window restriction is not an active evaluated
+feature here.  The run produced 96 fallbacks, all independently validated, and
+1665 feasible but not proven-optimal rows.  Convergence traces were unavailable,
+so we make no convergence-curve or time-to-convergence claim from these data.
+
+\end{document}

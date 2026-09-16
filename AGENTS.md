@@ -18,6 +18,25 @@ skills are mandatory context, not optional background reading.**
 Never skip or reorder these steps. Do not wait for the user to name the right
 skill keyword — infer it from the artifact you read.
 
+## SlackPipe Monorepo
+
+- `slackpipe/` is the tracked C++ optimizer/evaluator/exporter, not a separate
+  Git checkout. Never initialize a nested repository there.
+- Megatron execution and tests run in the existing `slackpipe-dev` container
+  (checkout at `/workspace/Megatron-LM`, Python `/opt/venv/bin/python`). Do not
+  install Megatron dependencies on the host. This machine has two visible GPUs.
+- Solver changes require no-OR and OR-enabled C++ tests. Configure the no-OR
+  build with `cmake -S slackpipe -B slackpipe/build/no-or -G Ninja
+  -DSLACKPIPE_ENABLE_ORTOOLS=OFF`, build, and run CTest inside the container.
+- The existing `slackpipe-ortools-runtime:local` image supplies OR-Tools.
+  Mount the whole monorepo and run `slackpipe/scripts/validate_ortools_evaluation.sh`
+  with `SLACKPIPE_OR_TEST_FILTER=.*`; see README for the complete command.
+- Plan/cost changes also require parser/manifest tests and a solver-to-PP=2
+  numerical-equivalence smoke test. Do not change solver semantics as part of
+  packaging or build-workflow changes.
+- Keep build trees, environments, generated plans/results/profiler output, and
+  paper build products out of commits. Stage explicit source paths only.
+
 ## Contributing
 
 ### Pull Requests
