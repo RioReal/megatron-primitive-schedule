@@ -2,4 +2,4 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-exec "${PYTHON:-python}" -m tools.slackpipe_hybrid baseline "$@"
+exec "${PYTHON:-python}" -m tools.run_slackpipe_nemotron_h8b_pp4 baseline-smoke "$@"

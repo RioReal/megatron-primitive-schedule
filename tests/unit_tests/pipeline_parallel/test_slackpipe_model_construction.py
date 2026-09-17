@@ -25,6 +25,7 @@ from megatron.core.pipeline_parallel.slackpipe.schedule import clear_slackpipe_r
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import unwrap_model
 from megatron.training.arguments import _configure_slackpipe_plan_args
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
@@ -182,6 +183,7 @@ def _build_model(
     config, pipeline_schedule="default", pp_size=1, vpp=None, layout=None, provider=None
 ):
     _set_minimal_training_args(
+        bf16=config.bf16,
         pipeline_schedule=pipeline_schedule,
         pipeline_model_parallel_size=pp_size,
         virtual_pipeline_model_parallel_size=vpp,
@@ -310,7 +312,7 @@ def _logical_named_parameters(model):
     chunks = model if isinstance(model, list) else [model]
     logical_params = {}
     decoder_layer_pattern = re.compile(r"^decoder\.layers\.(\d+)\.(.*)$")
-    for chunk in chunks:
+    for chunk in unwrap_model(chunks):
         local_to_global = {
             local_idx: layer.layer_number - 1
             for local_idx, layer in enumerate(chunk.decoder.layers)
@@ -327,7 +329,10 @@ def _logical_named_parameters(model):
 
 def _max_abs_parameter_diff(left, right):
     assert set(left) == set(right)
-    return max((left[name].detach() - right[name].detach()).abs().max().item() for name in left)
+    return max(
+        (left[name].detach().float() - right[name].detach().float()).abs().max().item()
+        for name in left
+    )
 
 
 def _max_abs_gradient_diff(left, right):
@@ -338,7 +343,7 @@ def _max_abs_gradient_diff(left, right):
         right_grad = right[name].grad
         assert (left_grad is None) == (right_grad is None), name
         if left_grad is not None:
-            max_diff = max(max_diff, (left_grad - right_grad).abs().max().item())
+            max_diff = max(max_diff, (left_grad.float() - right_grad.float()).abs().max().item())
     return max_diff
 
 

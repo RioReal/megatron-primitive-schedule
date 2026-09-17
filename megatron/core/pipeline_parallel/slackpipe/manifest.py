@@ -140,6 +140,15 @@ def validate_plan_model(plan, config) -> None:
             raise ValueError("SlackPipe cost profile model_manifest_hash does not match the model")
         if profile.get("schema_version") != plan.cost_profile_version:
             raise ValueError("SlackPipe cost profile version does not match the plan")
+        precision = profile.get("model_config", {}).get("dtype")
+        if precision is not None:
+            import torch
+
+            actual_precision = {torch.float32: "fp32", torch.bfloat16: "bf16"}.get(
+                config.params_dtype
+            )
+            if precision != actual_precision:
+                raise ValueError("SlackPipe cost profile dtype does not match the model")
 
 
 def validate_chunk_layers(plan, chunks, worker: int) -> list[dict]:

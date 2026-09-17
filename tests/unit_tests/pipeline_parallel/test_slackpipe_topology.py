@@ -2,6 +2,7 @@
 
 """Four-worker structure, without four-rank or CUDA execution."""
 
+import hashlib
 import json
 import sys
 from dataclasses import replace
@@ -166,7 +167,7 @@ def test_pp4_cache_separation(monkeypatch):
             assert get(p) is not a
         assert get(plan, device=1) is not a
         assert get(plan, shape=(32, 1, 128)) is not a
-        assert get(plan, dtype=torch.float64) is not a
+        assert get(plan, dtype=torch.bfloat16) is not a
         monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
         assert get(plan) is not a
     finally:
@@ -198,6 +199,10 @@ def test_hybrid_args_manifest_and_prefix_costs(tmp_path):
     config = nemotron_h_8b_config()
     manifest = build_model_manifest(config)
     assert config.num_layers == len(NEMOTRON_H_8B_PATTERN) == 52
+    assert (
+        hashlib.sha256(NEMOTRON_H_8B_PATTERN.encode()).hexdigest()
+        == "e0cf75d03b16c79cac23da4c217a5d3243d45043f07cb445ab358dad42fc4cf5"
+    )
     assert (
         config.hidden_size,
         config.ffn_hidden_size,
@@ -234,8 +239,48 @@ def test_nemotron_launch_arguments(monkeypatch, tmp_path, action):
     monkeypatch.setenv("RANK", "0")
     args = validate_args(parse_args())
     assert args.virtual_pipeline_model_parallel_size == 2
+    assert args.bf16 and args.params_dtype == torch.bfloat16
     assert args.pipeline_model_parallel_layout is None
     assert len(args.hybrid_layer_pattern.split("|")) == 8
     config = bind_hybrid_config(core_transformer_config_from_args(args), args.hybrid_layer_pattern)
     assert config.deallocate_pipeline_outputs == (action == "baseline")
     assert build_model_manifest(config) == build_model_manifest(nemotron_h_8b_config())
+
+
+@pytest.mark.parametrize("microbatches", [1, 4, 8, 16])
+@pytest.mark.parametrize("stages", [4, 8, 12])
+def test_generic_microbatches_and_chunks(microbatches, stages, monkeypatch):
+    payload = hybrid_plan()
+    payload.update(
+        num_microbatches=microbatches,
+        num_stages=stages,
+        layer_cuts=[12 * s // stages for s in range(stages + 1)],
+        stage_to_worker=[s % 4 for s in range(stages)],
+    )
+    payload["operations"] = [[] for _ in range(4)]
+    for kind, order in (("F", range(stages)), ("B", reversed(range(stages)))):
+        order = list(order)
+        for b in range(microbatches):
+            for s in order:
+                payload["operations"][s % 4].append(dict(kind=kind, microbatch=b, stage=s))
+    plan = parse_slackpipe_plan(payload, pipeline_model_parallel_size=4)
+    assert validate_plan_parallel_layout(plan, 4) == stages // 4
+    assert sum(len(plan.worker_operations(r)) for r in range(4)) == 2 * microbatches * stages
+    monkeypatch.setattr(
+        schedule.parallel_state, "get_pipeline_model_parallel_world_size", lambda: 1
+    )
+    for rank in range(4):
+        runtime = schedule._SlackPipeRuntime(
+            plan=plan,
+            pp_rank=rank,
+            pipeline_tensor_shape=(64, 1, 128),
+            pipeline_tensor_dtype=torch.bfloat16,
+            pipeline_tensor_device=torch.device("cpu"),
+            forward_only=False,
+            enable_fast_path=True,
+        )
+        assert runtime.local_stages == tuple(range(rank, stages, 4))
+        assert len(runtime.compiled_operations) == 2 * microbatches * stages // 4
+        for op in runtime.compiled_operations:
+            assert op.operation.stage % 4 == rank
+            assert op.local_index == op.operation.stage // 4

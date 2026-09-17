@@ -21,7 +21,7 @@ from .topology import logical_edges
 
 
 class SlackPipeRMACommunicator:
-    """Persistent, direction-isolated FP32 mailboxes on logical edge subgroups."""
+    """Persistent, direction-isolated mailboxes on logical edge subgroups."""
 
     def __init__(self, plan: SlackPipePlan):
         if not dist.is_initialized() or dist.get_world_size() != plan.num_workers:
@@ -47,20 +47,25 @@ class SlackPipeRMACommunicator:
         self.initialization_seconds = 0.0
         self.mailbox_bytes = 0
         self.slot_elements = 0
+        self.element_size = 0
         self.device_memory_delta_bytes = 0
         self.expected_sends = set()
         self.expected_receives = set()
         self.control = dist.new_group(backend="gloo", timeout=timedelta(seconds=60))
 
     def _initialize(self, shape, dtype, device):
-        if dtype != torch.float32 or device.type != "cuda":
-            raise ValueError("SlackPipe nccl-rma supports fixed CUDA FP32 tensors only")
+        if dtype not in (torch.float32, torch.bfloat16) or device.type != "cuda":
+            raise ValueError("SlackPipe nccl-rma supports fixed CUDA FP32/BF16 tensors only")
         started = time.perf_counter()
         free_before, _ = torch.cuda.mem_get_info()
         self.symm.set_backend("NCCL")
         self.shape = tuple(shape)
         self.device = torch.device("cuda", torch.cuda.current_device())
-        self.slot_elements = ((math.prod(shape) * 4 + 4095) // 4096) * 1024
+        self.dtype = dtype
+        self.element_size = torch.empty((), dtype=dtype).element_size()
+        self.slot_elements = (
+            (math.prod(shape) * self.element_size + 4095) // 4096 * 4096 // self.element_size
+        )
         # PyTorch registers one data window and one internal signal-pad window
         # per allocation/group. Rendezvous of subviews reuses those windows.
         for edge in self.edges:
@@ -116,7 +121,7 @@ class SlackPipeRMACommunicator:
             "transport": "nccl-rma",
             "channel_count": len(self.channels),
             "data_window_count": len(self.channels),
-            "data_window_bytes": self.num_microbatches * self.slot_elements * 4,
+            "data_window_bytes": self.num_microbatches * self.slot_elements * self.element_size,
             "signal_window_count": len(self.channels),
             "signal_window_bytes": self.symm.get_signal_pad_size(),
             "mailbox_bytes": self.mailbox_bytes,
@@ -176,7 +181,7 @@ class SlackPipeRMACommunicator:
     def _send(self, direction, edge, tensor, microbatch):
         if (
             tuple(tensor.shape) != self.shape
-            or tensor.dtype != torch.float32
+            or tensor.dtype != self.dtype
             or tensor.device != self.device
         ):
             raise ValueError("SlackPipe RMA send tensor metadata mismatch")

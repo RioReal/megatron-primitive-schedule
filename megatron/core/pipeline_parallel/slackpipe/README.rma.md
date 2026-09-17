@@ -4,7 +4,7 @@ Select `--pipeline-schedule slackpipe --slackpipe-plan PLAN --slackpipe-transpor
 The default is `nccl-p2p`. The ordinary Megatron schedules do not use this option.
 The solver plan and worker operation order are identical for both transports.
 
-This prototype requires cyclic placement, fixed CUDA FP32 tensor
+This prototype requires cyclic placement, fixed CUDA FP32 or BF16 tensor
 shapes, and NCCL >= 2.29. It uses the installed PyTorch private
 `torch.distributed._symmetric_memory` NCCL backend. It does not require nccl4py,
 a local compiled extension, or host dependencies. The capability and tests were
@@ -117,7 +117,7 @@ the consumer stream around the receive call (including the RMA consumer copy).
 measurements from a separate profiled iteration; measured benchmark steps need
 not enable per-operation timing.
 
-Still unsupported: PP>2, TP/DP/CP, BF16/FP16, variable shapes, distributed
+Hardware validation pending: PP>2. Still unsupported: TP/DP/CP, FP16, variable shapes, distributed
 optimizer, recomputation, CUDA graphs, communication-overlap optimizations,
 mailbox reuse within a step, and untested multi-node deployment. The tested
 transport is true NCCL RMA, not CUDA IPC or two-sided receive preposting.

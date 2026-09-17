@@ -1,5 +1,36 @@
 # SlackPipe Validation Coverage
 
+## Nemotron-H BF16 Preparation
+
+**PP=4 implementation ready; PP=4 hardware validation pending.** The local
+machine has only two GPUs. No full 8B model, RunPod allocation, or real benchmark
+was run for this preparation milestone.
+
+| Check | Local result / boundary |
+| --- | --- |
+| Native small hybrid BF16 PP1 | PASS: initial/loss/gradient/post-step max differences all 0 |
+| Native small hybrid BF16 PP2 P2P and RMA | PASS: all four max differences 0 |
+| Existing FP32 homogeneous, heterogeneous and hybrid equivalence | PASS: exact-zero assertions retained |
+| BF16 RMA delayed consumption, aligned slots and reuse | PASS; allocation/send/receive dtype checked |
+| W4/N8 with B=1,4,8,16 | Structural coverage; B8 has 128 operations |
+| W4 with N=4,8,12 | Structural coverage; VPP=1,2,3 and cyclic ownership |
+| Nemotron sequence identity | 52 global blocks; fixed SHA-256 fingerprint |
+| 8B calibration partition design | Offline full rank 6/6, six near-uniform partitions |
+| PP4 FP32/BF16 equivalence, either transport | Expected skip: requires 4 CUDA GPUs |
+| Real8B allocation, memory capacity, throughput and pod setup | Hardware validation pending |
+
+BF16 limits are absolute: initial parameters 0, normalized loss 2e-4, every
+gradient 2e-3, post-SGD parameters 5e-4. Comparisons cast to FP32 before
+subtracting. Observed local differences are zero; these limits are not a claim
+about arbitrary BF16 models. Native Megatron BF16 wrappers are exercised.
+The full regression suite, including dedicated transport/lifecycle cases, is
+run in the existing container: **90 passed / 15 expected skips at PP1**, and
+**97 passed / 8 expected skips per rank** for each PP2 transport selection.
+The 105 collected cases include two gated PP4 precision cases. C++ no-OR and
+OR-enabled CTest each pass 4/4; OR also passes 14 tiny CLI exports.
+See the [workflow and audit](slackpipe_pp4_hybrid.md)
+for commands, exact methodology, prerequisites and fail-closed receipts.
+
 ## PP4/Hybrid Extension
 
 PP4 structure is implemented; this host still exposes only two GPUs. The table
@@ -18,7 +49,7 @@ below distinguishes local execution from future four-GPU acceptance tests.
 | PP4 RMA runtime/numerical equivalence | NOT YET RUN - requires 4 GPUs |
 | Nemotron-H 8B allocation/training/benchmark | NOT RUN |
 
-The four-rank test skips with `requires 4 CUDA devices`; this is an intentionally
+The four-rank test skips with `requires 4 CUDA GPUs`; this is an intentionally
 uncovered hardware requirement, not a passing result. The Base-8K offline
 architecture adapter and launch scripts need no weight download.
 

@@ -25,7 +25,8 @@ def test_m1_fixture_preserves_delayed_match():
     assert (consumer.kind, consumer.microbatch, consumer.stage) == ("B", 0, 0)
 
 
-def test_rma_puts_complete_before_any_consumer_waits():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rma_puts_complete_before_any_consumer_waits(dtype):
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
         pytest.skip("requires torchrun with two GPUs")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -48,7 +49,7 @@ def test_rma_puts_complete_before_any_consumer_waits():
         pipeline_model_parallel_size=2,
     )
     comm = SlackPipeRMACommunicator(plan)
-    shape, dtype, device = (8, 1, 16), torch.float32, torch.device("cuda")
+    shape, device = (64, 1, 17), torch.device("cuda")
     sends, receives = [], []
     for s in range(3):
         for direction in ("forward", "backward"):
@@ -62,15 +63,22 @@ def test_rma_puts_complete_before_any_consumer_waits():
             receive_specs=receives, send_specs=sends, shape=shape, dtype=dtype, device=device
         )
         assert len({id(c["group"]) for c in comm.channels.values()}) == 6
+        element_size = torch.empty((), dtype=dtype).element_size()
+        assert comm.slot_elements * element_size % 4096 == 0
+        assert (
+            comm.statistics()["data_window_bytes"]
+            == plan.num_microbatches * comm.slot_elements * element_size
+        )
+        assert all(c["storage"].dtype == dtype for c in comm.channels.values())
         pointers = tuple(c["storage"].data_ptr() for c in comm.channels.values())
         if iteration == 0:
             original_pointers = pointers
         assert pointers == original_pointers
         direction, edge, b = sends[1]
         with pytest.raises(RuntimeError, match="FIFO"):
-            comm._send(direction, edge, torch.zeros(shape, device=device), b)
+            comm._send(direction, edge, torch.zeros(shape, device=device, dtype=dtype), b)
         for direction, edge, b in sends:
-            value = iteration * 1000 + edge[0] * 100 + (50 if direction == "backward" else 0) + b
+            value = iteration * 64 + edge[0] * 16 + (8 if direction == "backward" else 0) + b
             comm._send(direction, edge, torch.full(shape, value, dtype=dtype, device=device), b)
         # This must finish BEFORE either rank issues a wait_signal. Two-sided
         # send/recv cannot satisfy this test regardless of receive preposting.
@@ -78,7 +86,7 @@ def test_rma_puts_complete_before_any_consumer_waits():
         dist.barrier(group=comm.control)
         for direction, edge, b in receives:
             actual = comm._recv(direction, edge, b, shape, dtype, device)
-            expected = iteration * 1000 + edge[0] * 100 + (50 if direction == "backward" else 0) + b
+            expected = iteration * 64 + edge[0] * 16 + (8 if direction == "backward" else 0) + b
             assert torch.equal(actual, torch.full_like(actual, expected))
         comm.finalize_iteration()
         comm.assert_no_outstanding_work()

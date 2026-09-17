@@ -51,6 +51,8 @@ and untied input/output embeddings. Targeted homogeneous and heterogeneous PP=1
 and PP=2 tests compare loss, every logical parameter gradient, and post-SGD
 parameters against ordinary Megatron; supported tested cases have matched exactly.
 This is a research checkpoint, not a claim of validation for arbitrary models.
+Small native hybrid BF16 equivalence is also tested at PP=1 and PP=2 with both
+transports. BF16 PP=4 and real Nemotron-H 8B execution remain hardware-gated.
 
 ### Monorepo layout
 
@@ -283,24 +285,47 @@ Specify the parallel sizes used to collect those observations, not the target
 plan sizes. Generate the offline 8B manifest with
 `python -m tools.slackpipe_hybrid manifest --output MANIFEST`.
 
-Future pod commands, **inside** `nvcr.io/nvidia/pytorch:26.01-py3` with this
-checkout and the project's TE/Mamba/test dependencies installed:
+The first real experiment targets random-init Nemotron-H 8B Base-8K, BF16,
+PP=4/N=8/B=8, TP=DP=CP=1, microbatch size 1 and global batch size 8. The single
+architecture authority is `slackpipe/hybrid.py` inside the Megatron runtime
+package, sourced from a pinned released NVIDIA config. A fingerprint test locks
+the 52-block sequence. No weights are downloaded. Sequence length starts at
+1024; 2048/4096/8192 are explicit opt-ins with fresh calibration.
+
+After the [pod setup](docs/slackpipe_pp4_hybrid.md#pod-setup), run these explicit
+stages **inside** `nvcr.io/nvidia/pytorch:26.01-py3`. Nothing launches them all
+automatically:
 
 ```bash
-bash tools/runpod_slackpipe_verify.sh
-bash tools/runpod_slackpipe_correctness.sh
-SLACKPIPE_TEST_TRANSPORT=nccl-rma bash tools/runpod_slackpipe_correctness.sh
-bash tools/runpod_nemotron_baseline.sh --output /tmp/nemotron-baseline --dry-run
-bash tools/runpod_nemotron_slackpipe.sh --plan PLAN --output /tmp/nemotron-slackpipe --dry-run
+export OUT=/workspace/slackpipe-runs/nemotron-p2p
+python -m tools.run_slackpipe_nemotron_h8b_pp4 env --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 pp4-correctness --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 baseline-smoke --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 calibrate --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 solve --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 slackpipe-smoke --output "$OUT"
+# Only after successful smoke execution:
+python -m tools.run_slackpipe_nemotron_h8b_pp4 benchmark --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 trace --output "$OUT"
 ```
 
-The environment script does not install dependencies. RMA additionally needs
-NCCL >=2.29 and PyTorch symmetric-memory bindings, which are **not assumed** to
-be provided by that base image. First pass the small-hybrid four-GPU tests with
-both transports; only then remove `--dry-run` for a random-initialized 8B
-one-step smoke check. Sequence length defaults to 64 to bound activation memory.
-The scripts are not throughput benchmarks. BF16, large-sequence memory capacity,
-8B numerical validation and multi-node RMA remain separate future work.
+The four existing `tools/runpod_*.sh` wrappers delegate to the same gated driver.
+Use a separate output directory and `--transport nccl-rma` on every stage for
+RMA. Its preflight requires NCCL >=2.29 and the actual PyTorch RMA APIs; an image
+tag alone is not a capability guarantee. P2P can still deadlock on arbitrary
+optimized orders with delayed matching receives; timeouts fail the stage, never
+silently change the solver schedule or transport. The experimental RMA path
+removes that matching dependency but must pass its own four-GPU tests.
+Stock 26.01 was inspected and lacks PyTorch's `put_signal`/`wait_signal` APIs;
+the RMA campaign needs a separately validated compatible runtime overlay.
+
+Success receipts bind code, configuration and artifact hashes. Failed reruns
+invalidate downstream stages. Correctness runs FP32 first, BF16 second. A
+failed test, OOM, invalid profile/plan, or transport leak stops the workflow.
+Calibration uses ordinary interleaved stage-level synchronization, not benchmark
+timing. Benchmark modes compare uniform ordinary, optimized-partition ordinary,
+and SlackPipe schedules. Trace capture is separate and emits per-rank JSON,
+torch.profiler traces and PDF/PNG figures. `--dry-run` cannot authorize a stage.
 Strict hybrid equivalence runs set `MAMBA_DETERMINISTIC=1`,
 `TRITON_CACHE_AUTOTUNING=0`, and `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` **before**
 Python imports. The pod correctness script sets these. FP32 alone is insufficient
@@ -314,9 +339,10 @@ See [PP4 audit and validation](docs/slackpipe_pp4_hybrid.md) and the
   have structural tests; a real four-GPU run remains mandatory.
 - SlackPipe TP/DP/CP integration, distributed optimizer, activation recomputation,
   CUDA graphs, variable sequence lengths, and communication-overlap optimizations
-  are unsupported. BF16/FP16 are not validated in this development path.
+  are unsupported. FP16 is not validated; BF16 is validated only on small local
+  PP=1/PP=2 hybrid fixtures, not yet on PP=4 or the real 8B architecture.
 - Heterogeneous layers must be sequential decoder blocks with compatible
-  hidden-state interfaces. Native Mamba/attention/MLP hybrids have tiny FP32
+  hidden-state interfaces. Native Mamba/attention/MLP hybrids have tiny FP32/BF16
   PP=1/PP=2 tests. MoE, MTP, GDN and DSA SlackPipe paths are unsupported.
 - RMA multi-node deployment and multi-host profiler clock alignment are unsupported.
 - P2P retains matching-receive dependencies: DAG/FIFO validation alone does not

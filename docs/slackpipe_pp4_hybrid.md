@@ -1,5 +1,289 @@
 # PP4 and Hybrid Readiness
 
+## Nemotron-H 8B Preparation
+
+**PP=4 implementation ready; PP=4 hardware validation pending.** Preparation
+does not establish four-rank NCCL progress, 8B memory capacity, or throughput.
+No pod was rented, no weights downloaded, and no 8B run performed locally.
+
+### Architecture Authority
+
+`megatron/core/pipeline_parallel/slackpipe/hybrid.py::nemotron_h_8b_config`
+is the single architecture helper. Its source is NVIDIA's
+[released Base-8K config at revision 253e002](https://huggingface.co/nvidia/Nemotron-H-8B-Base-8K/blob/253e00241ff77421b6d811c971e9cee1b2d824ad/config.json).
+The native Megatron adapter supplies 52 hybrid blocks, hidden size 4096, FFN
+21504, 32 attention heads, 8 query groups, head dimension 128, RMSNorm epsilon
+1e-5, squared-ReLU MLPs, vocabulary 131072, maximum sequence length 8192, no
+position embeddings, and untied input/output weights. Mamba uses state 128,
+head dimension 64, 8 groups and 128 heads; pinned native defaults supply
+convolution 4, expansion 2 and chunk size 256. This is random initialization,
+not a pretrained checkpoint conversion.
+
+The exact sequence is
+`M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-`.
+Its SHA-256 is
+`e0cf75d03b16c79cac23da4c217a5d3243d45043f07cb445ab358dad42fc4cf5`.
+The unit test locks both this fingerprint and the layer count. Manifests come
+from the actual native config; architecture constants are not duplicated in
+shell scripts. Precision remains cost-profile execution metadata, not a change
+to partition-independent model identity.
+
+### BF16 Audit
+
+- Runtime previously rejected every dtype except FP32. It now accepts FP32 or
+  BF16 and rejects mismatched pipeline/parameter dtypes. Missing pipeline dtype
+  falls back to `config.params_dtype`, not FP32.
+- P2P payload receives already used runtime dtype. Its FP32 communicator warmup
+  is only a control exchange, not model data.
+- RMA allocation uses the configured dtype, send validation checks that same
+  dtype, and page-aligned slot strides/byte statistics use `element_size()`.
+  BF16 and FP32 mailboxes cannot share a cached transport.
+- Runtime and transport keys already include dtype, shape, B, topology, device
+  and group identity. Local detached inputs and backward gradients retain their
+  actual dtype; no extra boundary casts were introduced.
+- v2 profiles with precision metadata must match model dtype. The pod driver
+  also checks sequence length, profile fingerprint and model fingerprint.
+- Stage calibration measures actual BF16 native chunks. FP64 regression algebra
+  and FP32 loss/metric accumulation are intentional, not payload conversions.
+- Numerical helpers unwrap native Megatron BF16 modules and subtract FP32 views
+  of parameters/gradients. They do not round differences back to BF16.
+
+Small native hybrid PP1, PP2-P2P and PP2-RMA tests compare the same full ordinary
+model against plan-partitioned chunks. Seed/data are fixed, dropout is zero,
+and embeddings are untied. Initial values are copied by global logical name;
+all ranks verify ownership coverage. The reference accumulates eight ordinary
+microbatch losses/backwards and uses the same SGD update. All four local max
+differences are **0** in FP32 and BF16. FP32 continues to require exact equality.
+BF16 absolute limits are initial=0, loss=2e-4, gradient=2e-3, post-step=5e-4.
+The PP4 test executes FP32 first, then BF16, with one result file per rank and
+precision. Missing results (including skipped tests) cannot certify correctness.
+
+Structural tests cross B={1,4,8,16} with W=4/N={4,8,12}. They verify total
+operations `2*B*N`, FIFO coverage, `stage % W`, `stage // W` and runtime compiled
+chunk mapping. W4/N8/B8 has 128 operations; N12 is structural coverage only.
+
+## Pod Setup
+
+Start from `nvcr.io/nvidia/pytorch:26.01-py3` on four A100 SXM GPUs. Commands below
+are for the container, never the host. The checkout and output paths are
+configurable; the first sequence length is 1024. Setup on a fresh pod has not
+been hardware-validated locally. Preserve the container's CUDA/PyTorch stack
+when installing the repository's locked dependencies:
+
+```bash
+export ROOT=${ROOT:-/workspace/Megatron-LM}
+git clone --branch slackpipe/mvp https://github.com/RioReal/megatron-primitive-schedule.git "$ROOT"
+cd "$ROOT"
+apt-get update
+apt-get install -y build-essential cmake ninja-build curl python3-venv
+unset PIP_CONSTRAINT
+python -m pip install uv==0.7.2
+export UV_PROJECT_ENVIRONMENT=/opt/slackpipe-venv
+uv venv "$UV_PROJECT_ENVIRONMENT" --system-site-packages
+source "$UV_PROJECT_ENVIRONMENT/bin/activate"
+uv sync --locked --only-group build --no-install-package torch --no-install-package torchvision --no-install-package triton
+MAX_JOBS=2 uv sync --locked --extra training --extra ssm --extra te --group test \
+  --no-install-package torch --no-install-package torchvision --no-install-package triton
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS=1 TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0
+export MAMBA_DETERMINISTIC=1 TRITON_CACHE_AUTOTUNING=0 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+```
+
+The lock pins Mamba 2.3.2.post1 and causal-conv1d 1.6.2.post1. Deterministic
+Mamba support must be importable before accepting correctness. Do not use
+unversioned dependency upgrades to make a failing environment appear supported.
+
+Build the monorepo's joint solver using the official
+[OR-Tools 9.15 release](https://github.com/google/or-tools/releases/tag/v9.15):
+
+```bash
+export ORTOOLS_PREFIX=/opt/or-tools
+curl -fL https://github.com/google/or-tools/releases/download/v9.15/or-tools_amd64_ubuntu-24.04_cpp_v9.15.6755.tar.gz \
+  -o /tmp/or-tools.tar.gz
+mkdir -p "$ORTOOLS_PREFIX"
+tar -xzf /tmp/or-tools.tar.gz --strip-components=1 -C "$ORTOOLS_PREFIX"
+BUILD_JOBS=2 SLACKPIPE_OR_TEST_FILTER='.*' bash slackpipe/scripts/validate_ortools_evaluation.sh
+```
+
+**Known stock-image RMA blocker:** direct inspection of the locally available
+26.01 image reports PyTorch `2.10.0a0+a36e1d39eb.nv26.01.42222806`, NCCL 2.29.2,
+`rendezvous=True`, but `put_signal=False` and `wait_signal=False`. NCCL's version
+alone is insufficient. The local validated RMA stack uses PyTorch
+`2.12.0a0+0291f960b6.nv26.04.48445190` with NCCL 2.29.7. **Do not rent a pod for
+the RMA campaign assuming stock 26.01 will work.** A separately prepared,
+compatible PyTorch/TE/Mamba overlay with those APIs must pass preflight and
+the transport tests first. Such an overlay was not built or validated here;
+the workflow deliberately refuses RMA instead of patching private APIs or
+silently changing the requested base image. P2P setup is provided above, but
+arbitrary joint-solver orders may require RMA to make progress.
+
+## Explicit Pod Stages
+
+The existing four scripts are retained, with no duplicate role scripts:
+
+| Exact path | Purpose |
+| --- | --- |
+| `tools/runpod_slackpipe_verify.sh` | Metadata, hardware/dependency checks, four-rank NCCL sanity |
+| `tools/runpod_slackpipe_correctness.sh` | Tiny PP4/N8/B8 FP32 followed by BF16 equivalence |
+| `tools/runpod_nemotron_baseline.sh` | Ordinary native Megatron random-init BF16 8B smoke |
+| `tools/runpod_nemotron_slackpipe.sh` | Plan-derived native Megatron SlackPipe BF16 8B smoke |
+
+They delegate to `tools/run_slackpipe_nemotron_h8b_pp4.py`; all share the same
+prerequisites. The master can be invoked directly for every stage:
+
+```bash
+export OUT=/workspace/slackpipe-runs/nemotron-p2p
+python -m tools.run_slackpipe_nemotron_h8b_pp4 env --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 pp4-correctness --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 baseline-smoke --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 calibrate --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 solve --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 slackpipe-smoke --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 benchmark --output "$OUT"
+python -m tools.run_slackpipe_nemotron_h8b_pp4 trace --output "$OUT"
+```
+
+For a capable RMA image, repeat in a new output directory with
+`--transport nccl-rma` on **every** command. `--slackpipe-transport` is an alias.
+Use `--seq-length 2048`, `4096`, or `8192` consistently in a separate campaign.
+`--solver PATH`, `--solver-seconds 300`, `--warmups 5`, `--iterations 20` and
+`--timeout 1800` are configurable. No source/layout editing is needed.
+`--dry-run` reports prerequisites/settings without allocation or success receipt.
+
+`env` requires at least four visible A100 SXM GPUs, CUDA/NCCL/BF16 support,
+TE/Mamba imports, and by default 35 GiB free **on each selected GPU**. This is
+a conservative preflight floor, not a memory-capacity guarantee. It records
+GPU UUIDs, free/total memory, package versions and Git identity, then runs a
+four-rank FP32/BF16 NCCL all-reduce. Select the four devices with
+`CUDA_VISIBLE_DEVICES`; changing their assignment invalidates environment reuse.
+
+Every stage requires successful predecessors with matching code/config and
+artifact hashes. Failed reruns remove downstream receipts; stale files cannot
+authorize a run. Child process groups are terminated on timeout or interrupt.
+Failures in NCCL, small FP32/BF16 correctness, finite checks, resource cleanup,
+8B baseline allocation (including OOM at sequence 1024), regression rank,
+parser validation, or hashes stop the workflow. There is no automatic retry,
+smaller sequence fallback, precision change or schedule substitution.
+
+## Calibration, Timing and Traces
+
+`tools/slackpipe_nemotron_worker.py` supplies the shared native hybrid worker.
+Real runs are fixed W4/N8/B8, BF16; `--tiny` is a separate PP2/PP4 test harness
+and cannot create real-pod success receipts. Calibration uses ordinary Megatron
+interleaved 1F1B with six near-uniform partitions (boundary shifts at most two
+layers), at least ten measured iterations, and synchronized **stage-level**
+F/B events. The 8B design has three class columns and three role-bias columns,
+rank 6/6. Actual observations are fitted through the existing nonnegative
+class-cost regression and exact prefix/range cost builder. No synthetic values
+are substituted for measured costs.
+
+`solve` invokes the unchanged joint CP-SAT path with B8/N8/J4 and the fitted v2
+profile. Existing C++ evaluation precedes export. The Python validator then
+requires plan.v2, 128 operations, placement `[0,1,2,3,0,1,2,3]`, nonempty exact
+ranges, the authoritative manifest hash and the actual profile hash/path. The
+runtime derives native pipe-separated segments and VPP=2 from that plan.
+
+Benchmark modes are uniform ordinary, optimized-partition ordinary, and
+optimized-plan SlackPipe. They use identical per-logical-parameter mock seeds,
+stable Mamba state initialization, identical generated tokens and the same
+unwrapped-parameter SGD harness. This controlled harness is not a claim about
+end-to-end data-loader/checkpoint/optimizer throughput. Full CLI smoke uses
+Megatron's native BF16 optimizer. Warmups are excluded; CUDA events are placed
+only at iteration boundaries. Calibration, per-operation profiling and trace
+capture are disabled. Finite checks run outside the timing window. The summary
+reports each step's maximum rank time and mean/median across measured steps.
+
+Trace capture runs separately after benchmark success, for one iteration after
+the requested warmups. It reuses `figure_trace.label_logical_operations`,
+`compact_profiler_trace`, `validate_compact_trace`, and `tools.plot_schedule_trace`.
+There are per-rank raw torch traces, compact envelope JSON, validated SlackPipe
+worker-order traces, and a paired baseline/SlackPipe PDF/PNG. No multi-node clock
+alignment is attempted.
+
+Expected artifacts below `--output`:
+
+- `run_metadata.json`, `logs/`, `receipts/`.
+- `correctness/{fp32,bf16}.rank{0,1,2,3}.json` (differences, layers and operations).
+- `calibration/model_manifest.json`, `calibration_events.json`, `observations.json`,
+  `cost_profile.json`, `fit_diagnostics.json`, per-partition layer/result files.
+- `solve/slackpipe.plan.json` and the solver's existing result/orders/CSV files.
+- `benchmark/{baseline,partition,slackpipe}/result.rank*.json`, `benchmark/summary.json`.
+- `trace/{baseline,slackpipe}/rank*_torch.json`, `rank*_trace.json`,
+  SlackPipe runtime order JSON, `trace/timeline.{pdf,png}`, `figure_report.json`.
+
+Generated outputs, builds and dependency environments are not committed.
+All local Megatron tests run in `slackpipe-dev`; the stock-image API probe above
+only inspected its PyTorch installation, not Megatron execution.
+
+### Preparation Validation Record
+
+The BF16 worker was exercised locally using its tiny PP2 fixture: six ordinary
+calibration partitions produced a measured v2 profile; the unchanged C++ joint
+solver exported an OPTIMAL plan.v2; production parsing, RMA execution and
+BF16 numerical equivalence passed with all four maximum differences zero.
+Separate ordinary/SlackPipe captures passed envelope/order validation and
+produced a paired PDF/PNG. These are harness correctness checks, not an 8B
+performance experiment.
+
+The final 105-case SlackPipe suite reports 90 passed / 15 expected skips at
+PP1 and 97 passed / 8 expected skips per rank for each PP2 transport selection.
+Tiny BF16 full native `pretrain_hybrid.py` runs also take a finite, non-skipped
+SGD step: ordinary PP2/N2 and SlackPipe PP2/N4 RMA. The ordinary CLI retains its
+upstream prohibition on non-overlapped PP2 interleaving; it is not bypassed for
+this smoke test. Ordinary interleaved calibration is separately tested through
+the existing core scheduler harness. Full target PP4/N8 CLI arguments pass
+parsing/config validation without allocating the 8B model.
+
+RMA delayed-consumer tests exercise both element sizes and three persistent
+iterations. Ten reuse cycles and ten Megatron-context recreation cycles with
+the solver plan ended with zero live contexts, mailboxes and windows on both
+ranks (only WORLD remained before final process-group destruction). Both C++
+CTest configurations pass 4/4; OR validation also passes 14 CLI smoke exports.
+Hardware preflight on the local two-GPU machine correctly writes its failure
+metadata and refuses certification; an uncertified baseline invocation fails
+before model allocation. No four-GPU result is represented as a local pass.
+
+During harness testing, eager initialization of unused Megatron communicators
+exhausted the small local GPUs. The worker now binds each rank's device, warms
+WORLD, and retains lazy subgroup initialization, as the established test
+harness does. Rank-local exceptions are printed immediately and propagated to
+torchrun, instead of attempting collective teardown while a peer is still in
+model code. Successful runs still explicitly verify transport shutdown.
+
+### Files In This Preparation
+
+Paths below are relative to the repository root. `runtime/` abbreviates
+`megatron/core/pipeline_parallel/slackpipe/` and `tests/` abbreviates
+`tests/unit_tests/pipeline_parallel/`.
+
+| File | Change |
+| --- | --- |
+| `runtime/communication_rma.py` | BF16 allocation, metadata checks and byte-correct aligned mailboxes |
+| `runtime/schedule.py` | Config-derived dtype and FP32/BF16 guard |
+| `runtime/manifest.py` | Reject cost-profile/model precision mismatch |
+| `runtime/hybrid.py` | Clarify the existing authoritative architecture helper |
+| `runtime/README.rma.md` | Precision support and validation boundary |
+| `tests/test_slackpipe_hybrid.py` | Native BF16 wrappers, tolerances, finite checks and rank acceptance artifacts |
+| `tests/test_slackpipe_model_construction.py` | Shared wrapped-model parameter mapping and FP32 difference metrics |
+| `tests/test_slackpipe_rma.py` | FP32/BF16 delayed consumption, alignment and persistent reuse |
+| `tests/test_slackpipe_topology.py` | B/N matrix, sequence fingerprint, BF16 cache separation and launcher arguments |
+| `tests/test_slackpipe_nemotron_workflow.py` | Calibration rank, target-plan provenance and fail-closed gate tests |
+| `tools/slackpipe_hybrid.py` | BF16/1024 native CLI launch, atomic JSON helper, no unconditional tracing |
+| `tools/slackpipe_nemotron_worker.py` | Shared native calibration, controlled measurement and trace worker |
+| `tools/run_slackpipe_nemotron_h8b_pp4.py` | Explicit master stages, preflight, receipts, solver and plotting integration |
+| `tools/runpod_slackpipe_verify.sh` | Delegate environment verification to the master |
+| `tools/runpod_slackpipe_correctness.sh` | Delegate ordered FP32/BF16 correctness to the master |
+| `tools/runpod_nemotron_baseline.sh` | Delegate gated ordinary smoke to the master |
+| `tools/runpod_nemotron_slackpipe.sh` | Delegate gated plan-derived smoke to the master |
+| `README.md` | Target workflow, BF16 status and stock-image RMA blocker |
+| `docs/slackpipe_validation_matrix.md` | Current local passes, tolerances and hardware gates |
+| `docs/slackpipe_pp4_hybrid.md` | Setup, methodology, artifacts, audit and file map |
+
+## Previous PP4 Extension Record
+
+The following audit records the preceding FP32 milestone. Its historical test
+counts and validation boundaries are not the BF16 preparation results above.
+
 ## Audit Before Edits
 
 - `schedule._validate_supported_parallelism` rejected PP outside {1,2}; two
@@ -123,8 +407,8 @@ RMA addressing or numerical correctness. Run those checks on A100 SXM x4 before
 attempting the offline adapter's full 8B one-step smoke launch.
 
 No weights were downloaded. The Base-8K architecture adapter records the exact
-released source revision. FP32 allocation/activation capacity, eight-stage 8B
-execution, long sequences, BF16 and multi-node remain unvalidated. P2P's known
+released source revision. Full 8B allocation/activation capacity, eight-stage 8B
+execution, long sequences and multi-node remain unvalidated. P2P's known
 delayed-matching progress limitation is unchanged; arbitrary optimized orders
 must also be validated with the experimental RMA path.
 

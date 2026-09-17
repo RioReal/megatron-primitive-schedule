@@ -56,7 +56,7 @@ NEMOTRON_H_8B_MAX_SEQUENCE_LENGTH = 8192
 
 
 def nemotron_h_8b_config(**overrides):
-    """Offline random-init architecture, not a weight loader or BF16 validation.
+    """Authoritative offline random-init architecture, not a weight loader.
 
     The released Base-8K config is the source of dimensions and block order.
     Pinned MambaMixer defaults supply conv=4, expand=2 and chunk_size=256.

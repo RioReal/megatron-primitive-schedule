@@ -113,7 +113,7 @@ def forward_backward_slackpipe(
 
     cp_group_size = _get_cp_group_size(pg_collection)
     pipeline_tensor_shape = (seq_length, micro_batch_size, config.hidden_size)
-    pipeline_tensor_dtype = config.pipeline_dtype or torch.float32
+    pipeline_tensor_dtype = config.pipeline_dtype or config.params_dtype
     pipeline_tensor_device = torch.device("cuda")
     runtime = _get_slackpipe_runtime(
         slackpipe_plan_path,
@@ -702,8 +702,10 @@ def _rank_trace_path(trace_path: str, pp_rank: int) -> Path:
 
 
 def _validate_unsupported_features(config, forward_only: bool) -> None:
-    if config.params_dtype != torch.float32 or config.pipeline_dtype not in (None, torch.float32):
-        raise ValueError("SlackPipe currently supports FP32 only")
+    if config.params_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("SlackPipe supports FP32 and BF16 only")
+    if config.pipeline_dtype not in (None, config.params_dtype):
+        raise ValueError("SlackPipe pipeline dtype must match model parameter dtype")
     if getattr(config, "recompute_granularity", None) is not None:
         raise ValueError("SlackPipe does not support activation recomputation")
     if getattr(config, "num_moe_experts", None) or getattr(config, "mtp_num_layers", None):

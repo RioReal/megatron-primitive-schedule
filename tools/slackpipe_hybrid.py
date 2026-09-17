@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import torch
+
 from megatron.core.pipeline_parallel.slackpipe.cost_profile import build_heterogeneous_cost_profile
 from megatron.core.pipeline_parallel.slackpipe.hybrid import (
     NEMOTRON_H_8B_MAX_SEQUENCE_LENGTH,
@@ -30,8 +32,18 @@ from megatron.core.pipeline_parallel.slackpipe.plan import (
 )
 
 
+def write_json(path: Path, payload: object) -> None:
+    """Atomically publish a completed workflow artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp.replace(path)
+
+
 def launch_command(args):
-    config = nemotron_h_8b_config()
+    config = nemotron_h_8b_config(
+        params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16, bf16=True
+    )
     if not 1 <= args.seq_length <= NEMOTRON_H_8B_MAX_SEQUENCE_LENGTH:
         raise ValueError("Base-8K sequence length must be in [1, 8192]")
     extra = []
@@ -40,7 +52,7 @@ def launch_command(args):
             raise ValueError("--plan is required for SlackPipe")
         plan = load_slackpipe_plan(args.plan, pipeline_model_parallel_size=4)
         validate_plan_parallel_layout(plan, 4)
-        if (plan.num_stages, plan.num_microbatches, plan.num_layers) != (8, 8, 52):
+        if (plan.num_stages, plan.num_microbatches, plan.num_layers) != (8, 8, config.num_layers):
             raise ValueError("Nemotron-H target requires N=8, B=8, L=52")
         validate_plan_model(plan, config)
         extra = [
@@ -50,12 +62,12 @@ def launch_command(args):
             str(args.plan),
             "--slackpipe-transport",
             args.transport,
-            "--slackpipe-trace",
-            str(args.output / "trace.json"),
         ]
     else:
-        cuts = [52 * s // 8 for s in range(9)]
-        plan = SimpleNamespace(num_layers=52, stage_layer_ranges=tuple(zip(cuts, cuts[1:])))
+        cuts = [config.num_layers * s // 8 for s in range(9)]
+        plan = SimpleNamespace(
+            num_layers=config.num_layers, stage_layer_ranges=tuple(zip(cuts, cuts[1:]))
+        )
     pattern = partition_hybrid_pattern(NEMOTRON_H_8B_PATTERN, plan)
     return [
         sys.executable,
@@ -64,6 +76,7 @@ def launch_command(args):
         "--standalone",
         "--nproc-per-node=4",
         "pretrain_hybrid.py",
+        "--bf16",
         "--pipeline-model-parallel-size",
         "4",
         "--tensor-model-parallel-size",
@@ -111,7 +124,7 @@ def launch_command(args):
         "--seq-length",
         str(args.seq_length),
         "--max-position-embeddings",
-        "8192",
+        str(NEMOTRON_H_8B_MAX_SEQUENCE_LENGTH),
         "--micro-batch-size",
         "1",
         "--global-batch-size",
@@ -162,7 +175,7 @@ def main():
     )
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--transport", choices=("nccl-p2p", "nccl-rma"), default="nccl-p2p")
-    parser.add_argument("--seq-length", type=int, default=64)
+    parser.add_argument("--seq-length", type=int, default=1024)
     parser.add_argument(
         "--calibration-pp", type=int, help="physical PP used to collect fit observations"
     )
@@ -208,8 +221,6 @@ def main():
     command = launch_command(args)
     print(shlex.join(command), flush=True)
     if not args.dry_run:
-        import torch
-
         if torch.cuda.device_count() != 4:
             parser.error("requires 4 CUDA devices; use CUDA_VISIBLE_DEVICES to select exactly four")
         args.output.mkdir(parents=True, exist_ok=True)

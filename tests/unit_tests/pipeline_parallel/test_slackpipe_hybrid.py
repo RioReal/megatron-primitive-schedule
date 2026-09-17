@@ -30,6 +30,7 @@ from megatron.core.pipeline_parallel.slackpipe.schedule import (
     slackpipe_transport_statistics,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import unwrap_model
 from tests.unit_tests.pipeline_parallel.slackpipe_perf_benchmark import _make_batches
 from tests.unit_tests.pipeline_parallel.test_slackpipe_model_construction import (
     _assert_parameters_and_gradients_finite,
@@ -47,7 +48,7 @@ PATTERN = "M-*MM-*-M-*-"
 CUTS = (0, 1, 3, 4, 6, 7, 9, 10, 12)
 
 
-def tiny_config(pp=1, vpp=None, schedule="default"):
+def tiny_config(pp=1, vpp=None, schedule="default", dtype=torch.float32):
     return bind_hybrid_config(
         TransformerConfig(
             num_layers=len(PATTERN),
@@ -59,7 +60,9 @@ def tiny_config(pp=1, vpp=None, schedule="default"):
             mamba_num_groups=1,
             normalization="RMSNorm",
             use_cpu_initialization=True,
-            pipeline_dtype=torch.float32,
+            pipeline_dtype=dtype,
+            params_dtype=dtype,
+            bf16=dtype == torch.bfloat16,
             pipeline_model_parallel_size=pp,
             virtual_pipeline_model_parallel_size=vpp,
             pipeline_schedule=schedule,
@@ -115,9 +118,10 @@ def hybrid_provider(pattern):
 
 
 @pytest.mark.parametrize("pp", [1, 2, 4])
-def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch):
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch, precision):
     if pp == 4 and torch.cuda.device_count() < 4:
-        pytest.skip("requires 4 CUDA devices")
+        pytest.skip("requires 4 CUDA GPUs")
     if int(os.environ.get("WORLD_SIZE", "1")) != pp:
         pytest.skip(f"requires {pp} ranks")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
@@ -131,7 +135,8 @@ def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch):
         path.write_text(json.dumps(hybrid_plan(pp)))
     plan = load_slackpipe_plan(path, pipeline_model_parallel_size=pp)
     Utils.initialize_model_parallel(1, 1)
-    baseline = _build_model(tiny_config(), provider=hybrid_provider(PATTERN))
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float32
+    baseline = _build_model(tiny_config(dtype=dtype), provider=hybrid_provider(PATTERN))
     reference = _logical_named_parameters(baseline)
     batches = _make_batches(
         SimpleNamespace(
@@ -156,7 +161,7 @@ def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch):
     parallel_state.set_virtual_pipeline_model_parallel_world_size(vpp)
     try:
         chunks = _build_model(
-            tiny_config(pp, vpp, "slackpipe"),
+            tiny_config(pp, vpp, "slackpipe", dtype),
             pipeline_schedule="slackpipe",
             pp_size=pp,
             vpp=vpp,
@@ -164,13 +169,14 @@ def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch):
             provider=hybrid_provider(partition_hybrid_pattern(PATTERN, plan)),
         )
         rank = parallel_state.get_pipeline_model_parallel_rank()
+        raw_chunks = unwrap_model(chunks)
         records = validate_chunk_layers(plan, chunks, rank)
         assert [r["layer_id"] for r in records] == [
             i for s in range(rank, plan.num_stages, pp) for i in plan.stage_layer_ids(s)
         ]
         assert [c.vp_stage for c in chunks] == list(range(vpp))
-        assert [c.pre_process for c in chunks] == [rank == 0 and i == 0 for i in range(vpp)]
-        assert [c.post_process for c in chunks] == [
+        assert [c.pre_process for c in raw_chunks] == [rank == 0 and i == 0 for i in range(vpp)]
+        assert [c.post_process for c in raw_chunks] == [
             rank == pp - 1 and i == vpp - 1 for i in range(vpp)
         ]
         actual = _logical_named_parameters(chunks)
@@ -197,6 +203,8 @@ def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch):
             forward_only=False,
         )
         assert len(losses) == (plan.num_microbatches if rank == plan.stage_to_worker[-1] else 0)
+        assert all(torch.isfinite(loss["loss"]).all() for loss in losses)
+        assert all(torch.isfinite(loss).all() for loss in ref_losses)
         differences["loss"] = max(
             [abs((a["loss"] - b).item()) for a, b in zip(losses, ref_losses)] or [0.0]
         )
@@ -225,11 +233,32 @@ def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch):
             not s["active_iteration"] and s["outstanding_puts"] == 0
             for s in slackpipe_transport_statistics()
         )
-        print(f"Hybrid PP{pp} max absolute differences: {differences}")
-        assert all(value == 0.0 for value in differences.values())
+        print(f"Hybrid PP{pp} {precision} max absolute differences: {differences}")
+        # BF16 has 7 mantissa bits. Bound accumulated-gradient error separately
+        # from the FP32 loss and the rounded BF16 SGD update; never relax FP32.
+        limits = dict(initial=0.0, loss=2e-4, gradient=2e-3, post_step=5e-4)
+        assert all(
+            value <= (limits[name] if precision == "bf16" else 0.0)
+            for name, value in differences.items()
+        )
+        if os.environ.get("SLACKPIPE_CORRECTNESS_OUTPUT"):
+            destination = Path(os.environ["SLACKPIPE_CORRECTNESS_OUTPUT"])
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / f"{precision}.rank{rank}.json").write_text(
+                json.dumps(
+                    dict(
+                        pp=pp,
+                        precision=precision,
+                        differences=differences,
+                        matched_plan=True,
+                        layer_records=records,
+                        operations=trace["operations"],
+                    )
+                )
+            )
         config = chunks[0].config
         original = config.slackpipe_hybrid_pattern
-        first_id = chunks[0].decoder.layers[0].layer_number - 1
+        first_id = raw_chunks[0].decoder.layers[0].layer_number - 1
         replacement = "-" if original[first_id] != "-" else "M"
         config.slackpipe_hybrid_pattern = (
             original[:first_id] + replacement + original[first_id + 1 :]
