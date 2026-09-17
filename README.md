@@ -206,25 +206,36 @@ Consult each tool's `--help` before launching an experiment campaign.
 For trace capture and plotting, see the
 [figure workflow](megatron/core/pipeline_parallel/slackpipe/README.figure_trace.md).
 Generated plans, profiles, experiment outputs, and raw traces are ignored and
-must be regenerated; the small delayed-receive plan under test fixtures is an
-intentional regression input, not a benchmark artifact.
+must be regenerated; the small solver-order plans under test fixtures are
+intentional regression inputs, not benchmark artifacts.
 
 ### Targeted tests
 
-Run the same focused suite with one rank and then two ranks. World-size-specific
-tests skip when inappropriate; optional external-plan tests skip when generated
-artifacts are absent. Manifest tests are in `test_slackpipe_heterogeneous.py`.
+All applicable targeted tests pass in the validated two-GPU FP32 environment;
+configuration-specific tests are exercised in their corresponding PP/transport
+runs. Run the focused suite with one rank, then two ranks with each transport.
+World-size-specific tests skip only in the inapplicable invocation. Solver-order
+regressions use checked-in fixtures, not optional campaign artifacts. See the
+[validation matrix and skip audit](docs/slackpipe_validation_matrix.md).
+Manifest tests are in `test_slackpipe_heterogeneous.py`.
 
 ```bash
 docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 slackpipe-dev bash -c \
   '/opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=1 \
-  -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q'
+  -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q -ra'
 
 docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. \
+  -e CUDA_VISIBLE_DEVICES=0,1 -e SLACKPIPE_TEST_TRANSPORT=nccl-p2p \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 slackpipe-dev bash -c \
   '/opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q'
+  -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q -ra'
+
+docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. \
+  -e CUDA_VISIBLE_DEVICES=0,1 -e SLACKPIPE_TEST_TRANSPORT=nccl-rma \
+  -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 slackpipe-dev bash -c \
+  '/opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q -ra'
 ```
 
 These cover plan v1/v2, cost v1/v2, manifests, PP=1/PP=2 construction and numerical

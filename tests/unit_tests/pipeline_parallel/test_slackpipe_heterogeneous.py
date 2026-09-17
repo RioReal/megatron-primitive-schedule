@@ -318,7 +318,9 @@ def test_heterogeneous_numerical_equivalence(tmp_path, pp):
             pipeline_schedule="slackpipe",
             slackpipe_plan_path=str(path),
             slackpipe_trace_path=str(root / "trace.json"),
-            slackpipe_transport="nccl-rma" if pp == 2 else "nccl-p2p",
+            slackpipe_transport=(
+                os.environ.get("SLACKPIPE_TEST_TRANSPORT", "nccl-rma") if pp == 2 else "nccl-p2p"
+            ),
         )(
             forward_step_func=_forward_step_func,
             data_iterator=[_batch_iterator(batches) for _ in chunks],

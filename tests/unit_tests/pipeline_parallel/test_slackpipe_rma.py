@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import json
 import os
 from pathlib import Path
 
@@ -116,13 +117,10 @@ def test_rma_existing_solver_plans(tmp_path, monkeypatch, plan_name):
         test_slackpipe_pp2_numerical_equivalence,
     )
 
-    root = Path(__file__).resolve().parents[3]
-    if plan_name == "measured":
-        path = root / "slackpipe_plans/perf/b8-n4-w2-l16-measured-cost-slackpipe.plan.json"
-    else:
-        path = root / "slackpipe_experiments_smoke/S_b8_seq64/plans" / f"{plan_name}.plan.json"
-    if not path.exists():
-        pytest.skip("requires generated solver-plan artifacts")
+    fixtures = Path(__file__).parent / "slackpipe_fixtures" / "solver_order_regressions.json"
+    payload = json.loads(fixtures.read_text())[plan_name]
+    path = tmp_path / f"{plan_name}.plan.json"
+    path.write_text(json.dumps(payload))
     monkeypatch.setenv("SLACKPIPE_TEST_TRANSPORT", "nccl-rma")
     monkeypatch.setenv("SLACKPIPE_EXTERNAL_PP2_PLAN", str(path))
     artifact_root = os.environ.get("SLACKPIPE_RMA_ARTIFACT_DIR")

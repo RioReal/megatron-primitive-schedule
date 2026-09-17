@@ -431,6 +431,7 @@ def test_slackpipe_pp1_numerical_equivalence(tmp_path):
         forward_only=False,
     )
 
+    assert len(baseline_losses) == len(slackpipe_losses) == 4
     loss_diff = max(
         (baseline_loss["loss"] - slackpipe_loss["loss"]).abs().max().item()
         for baseline_loss, slackpipe_loss in zip(baseline_losses, slackpipe_losses)
@@ -560,6 +561,10 @@ def test_slackpipe_pp2_numerical_equivalence(tmp_path):
             forward_only=False,
         )
 
+        is_last_worker = (
+            parallel_state.get_pipeline_model_parallel_rank() == parsed_plan.stage_to_worker[-1]
+        )
+        assert len(slackpipe_losses) == (num_microbatches if is_last_worker else 0)
         local_loss_diff = 0.0
         for baseline_loss in baseline_losses:
             assert torch.isfinite(baseline_loss["loss"]).all()
