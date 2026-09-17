@@ -30,7 +30,7 @@ ordinary Megatron calibration -> cost profile -> ./slackpipe C++ CP-SAT optimize
 
 ### Current functionality
 
-- Physical PP=1 and PP=2, logical/VPP stages, cyclic stage-to-worker placement,
+- Runtime-validated physical PP=1 and PP=2, logical/VPP stages, cyclic stage-to-worker placement,
   nonuniform partitions, and solver-defined worker-local F/B operation orders.
 - Plan parsing validates coverage, FIFO ordering, worker ownership, and the
   combined computation/worker-order DAG. Plans determine the custom Megatron
@@ -214,25 +214,29 @@ intentional regression inputs, not benchmark artifacts.
 All applicable targeted tests pass in the validated two-GPU FP32 environment;
 configuration-specific tests are exercised in their corresponding PP/transport
 runs. Run the focused suite with one rank, then two ranks with each transport.
-World-size-specific tests skip only in the inapplicable invocation. Solver-order
+World-size-specific tests skip in inapplicable invocations; PP4 remains unrun
+here and skips explicitly for missing devices. Solver-order
 regressions use checked-in fixtures, not optional campaign artifacts. See the
 [validation matrix and skip audit](docs/slackpipe_validation_matrix.md).
-Manifest tests are in `test_slackpipe_heterogeneous.py`.
+Manifest tests are in `test_slackpipe_heterogeneous.py` and `test_slackpipe_topology.py`.
 
 ```bash
 docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. \
+  -e MAMBA_DETERMINISTIC=1 -e TRITON_CACHE_AUTOTUNING=0 -e NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 slackpipe-dev bash -c \
   '/opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=1 \
   -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q -ra'
 
 docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. \
   -e CUDA_VISIBLE_DEVICES=0,1 -e SLACKPIPE_TEST_TRANSPORT=nccl-p2p \
+  -e MAMBA_DETERMINISTIC=1 -e TRITON_CACHE_AUTOTUNING=0 -e NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 slackpipe-dev bash -c \
   '/opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
   -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q -ra'
 
 docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. \
   -e CUDA_VISIBLE_DEVICES=0,1 -e SLACKPIPE_TEST_TRANSPORT=nccl-rma \
+  -e MAMBA_DETERMINISTIC=1 -e TRITON_CACHE_AUTOTUNING=0 -e NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 slackpipe-dev bash -c \
   '/opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
   -m pytest tests/unit_tests/pipeline_parallel/test_slackpipe_*.py -q -ra'
@@ -244,14 +248,76 @@ export. The RMA tests require the compatible stack described above. Additional
 reuse/teardown stress is available in `slackpipe_rma_lifecycle_stress.py` with
 `--cycles`, `--reuse`, and `--managed-groups` options.
 
+### Nemotron-H 8B / PP=4 validation
+
+The next hardware target is **A100 SXM x4, PP=4, N=8, B=8**, FP32,
+TP=DP=CP=1. This is **implemented structurally**, not runtime validated on four
+GPUs. The gated tests report `requires 4 CUDA devices` on this two-GPU host.
+No 8B weights are downloaded and no Nemotron benchmark has been run.
+
+The [offline adapter](megatron/core/pipeline_parallel/slackpipe/hybrid.py) targets
+[NVIDIA Nemotron-H-8B-Base-8K](https://huggingface.co/nvidia/Nemotron-H-8B-Base-8K/blob/253e00241ff77421b6d811c971e9cee1b2d824ad/config.json):
+52 hybrid blocks, hidden size 4096, FFN 21504, 32 attention heads, 8 query groups,
+vocabulary 131072, and maximum sequence length 8192. It retains the released
+block order and uses pinned Megatron `HybridModel` with untied embeddings and
+no position embeddings. Random FP32 initialization is a validation mode, not a
+claim of checkpoint or BF16 equivalence.
+
+`model_manifest.v1` now also represents the full hybrid sequence with
+`layer_id`/`global_layer_id`, type and configuration class. `M`, `*`, and `-`
+mean native Mamba, attention-only and MLP-only blocks; there is no standalone
+no-op symbol in this pinned hybrid implementation. Plan.v2 ranges index this
+sequence directly. The plan generates pipe-separated hybrid segments; do not
+also supply a transformer `t` layout. Runtime validation checks actual global
+IDs and module types. `stage_layer_types` and `stage_class_counts` expose each
+range's composition. Costs still use generic class regression and prefix sums;
+the C++ optimizer has no hybrid-specific formulas.
+
+For native tiny-hybrid **ordinary Megatron** stage-level calibration, add
+`--hybrid` to `tools/slackpipe_heterogeneous_experiment.py` above. It uses six
+identifiable partitions, not per-layer synchronization. Generic observations
+with `begin`, `end`, `stage_role`, `forward_ms_per_op` and `backward_ms_per_op`
+can be fitted with `python -m tools.slackpipe_hybrid fit --manifest MANIFEST
+--observations ROWS --calibration-pp PP --calibration-vpp VPP --output PROFILE`.
+Specify the parallel sizes used to collect those observations, not the target
+plan sizes. Generate the offline 8B manifest with
+`python -m tools.slackpipe_hybrid manifest --output MANIFEST`.
+
+Future pod commands, **inside** `nvcr.io/nvidia/pytorch:26.01-py3` with this
+checkout and the project's TE/Mamba/test dependencies installed:
+
+```bash
+bash tools/runpod_slackpipe_verify.sh
+bash tools/runpod_slackpipe_correctness.sh
+SLACKPIPE_TEST_TRANSPORT=nccl-rma bash tools/runpod_slackpipe_correctness.sh
+bash tools/runpod_nemotron_baseline.sh --output /tmp/nemotron-baseline --dry-run
+bash tools/runpod_nemotron_slackpipe.sh --plan PLAN --output /tmp/nemotron-slackpipe --dry-run
+```
+
+The environment script does not install dependencies. RMA additionally needs
+NCCL >=2.29 and PyTorch symmetric-memory bindings, which are **not assumed** to
+be provided by that base image. First pass the small-hybrid four-GPU tests with
+both transports; only then remove `--dry-run` for a random-initialized 8B
+one-step smoke check. Sequence length defaults to 64 to bound activation memory.
+The scripts are not throughput benchmarks. BF16, large-sequence memory capacity,
+8B numerical validation and multi-node RMA remain separate future work.
+Strict hybrid equivalence runs set `MAMBA_DETERMINISTIC=1`,
+`TRITON_CACHE_AUTOTUNING=0`, and `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` **before**
+Python imports. The pod correctness script sets these. FP32 alone is insufficient
+to guarantee bitwise-identical Mamba backward reductions/autotuning choices.
+See [PP4 audit and validation](docs/slackpipe_pp4_hybrid.md) and the
+[validation matrix](docs/slackpipe_validation_matrix.md).
+
 ### Current limitations
 
-- PP>2 is not validated; the current runtime is restricted to PP=1/PP=2.
+- PP>2 runtime is not validated. Generic cyclic mappings, including PP=4/N=8,
+  have structural tests; a real four-GPU run remains mandatory.
 - SlackPipe TP/DP/CP integration, distributed optimizer, activation recomputation,
   CUDA graphs, variable sequence lengths, and communication-overlap optimizations
   are unsupported. BF16/FP16 are not validated in this development path.
 - Heterogeneous layers must be sequential decoder blocks with compatible
-  hidden-state interfaces. Mamba, MoE, and MTP topologies are not supported here.
+  hidden-state interfaces. Native Mamba/attention/MLP hybrids have tiny FP32
+  PP=1/PP=2 tests. MoE, MTP, GDN and DSA SlackPipe paths are unsupported.
 - RMA multi-node deployment and multi-host profiler clock alignment are unsupported.
 - P2P retains matching-receive dependencies: DAG/FIFO validation alone does not
   guarantee progress for every solver order. Delayed-matching schedules are

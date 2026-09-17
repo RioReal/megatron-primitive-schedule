@@ -92,6 +92,11 @@ def main():
     parser.add_argument("--num-attention-heads", type=int, default=4)
     parser.add_argument("--seq-length", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=0.000001)
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="calibrate the tiny native Mamba/attention/MLP fixture",
+    )
     args = parser.parse_args()
     if args.iterations < 10:
         parser.error("at least 10 calibration iterations are required")
@@ -103,14 +108,37 @@ def main():
     clear_nvte_env_vars()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    manifest = build_model_manifest(
-        make_config(hidden_size=args.hidden_size, num_attention_heads=args.num_attention_heads)
-    )
+    if args.hybrid:
+        from megatron.core.pipeline_parallel.slackpipe.hybrid import partition_hybrid_pattern
+        from tests.unit_tests.pipeline_parallel.test_slackpipe_hybrid import (
+            PATTERN,
+            hybrid_plan,
+            hybrid_provider,
+            tiny_config,
+        )
+        from tests.unit_tests.pipeline_parallel.test_slackpipe_model_construction import (
+            _build_model,
+        )
+
+        if (args.hidden_size, args.num_attention_heads) != (128, 4) or args.seq_length > 64:
+            parser.error("tiny hybrid calibration requires H=128, heads=4, sequence length <=64")
+        manifest = build_model_manifest(tiny_config())
+    else:
+        manifest = build_model_manifest(
+            make_config(hidden_size=args.hidden_size, num_attention_heads=args.num_attention_heads)
+        )
     partitions, diagnostics = select_partitions(manifest)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if rank == 0:
         args.heterogeneous_config.write_text(
-            json.dumps(block_config_payload(args.hidden_size, args.num_attention_heads), indent=2)
+            json.dumps(
+                (
+                    {"hybrid_layer_pattern": PATTERN}
+                    if args.hybrid
+                    else block_config_payload(args.hidden_size, args.num_attention_heads)
+                ),
+                indent=2,
+            )
         )
         (args.output_dir / "model_manifest.json").write_text(json.dumps(manifest, indent=2))
     Utils.initialize_model_parallel(1, 2, virtual_pipeline_model_parallel_size=2)
@@ -125,8 +153,16 @@ def main():
                 "schedule": "default",
                 "layout": bench._layout_from_split(split),
             }
-            model = bench._build_model(args, mode)
-            construction_plan = hand_plan(2, cuts)
+            if args.hybrid:
+                construction_plan = hybrid_plan(2)
+                construction_plan["layer_cuts"] = cuts
+                pattern = partition_hybrid_pattern(PATTERN, parse_slackpipe_plan(construction_plan))
+                model = _build_model(
+                    tiny_config(2, 2), pp_size=2, vpp=2, provider=hybrid_provider(pattern)
+                )
+            else:
+                model = bench._build_model(args, mode)
+                construction_plan = hand_plan(2, cuts)
             construction_plan["model_manifest_hash"] = manifest["manifest_hash"]
             rows = validate_chunk_layers(parse_slackpipe_plan(construction_plan), model, rank)
             actual_layers.append({"cuts": cuts, "layers": rows})

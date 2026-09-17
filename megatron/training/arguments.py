@@ -429,6 +429,13 @@ def _configure_slackpipe_plan_args(args):
         f"--slackpipe-plan ({explicit_layout!r} != {derived_layout!r})"
     )
     args.pipeline_model_parallel_layout = derived_layout
+    pattern = getattr(args, 'hybrid_layer_pattern', None)
+    if pattern is not None:
+        from megatron.core.pipeline_parallel.slackpipe.hybrid import partition_hybrid_pattern
+
+        args.hybrid_layer_pattern = partition_hybrid_pattern(pattern, plan)
+        # HybridModel uses its native pipe-separated pattern, not transformer t tokens.
+        args.pipeline_model_parallel_layout = None
     args.virtual_pipeline_model_parallel_size = (
         virtual_pipeline_model_parallel_size
         if virtual_pipeline_model_parallel_size > 1
@@ -479,8 +486,8 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.pipeline_schedule == 'slackpipe':
-        assert args.pipeline_model_parallel_size in (1, 2), \
-            'SlackPipe prototype requires --pipeline-model-parallel-size=1 or 2'
+        assert args.pipeline_model_parallel_size >= 1, \
+            'SlackPipe requires positive --pipeline-model-parallel-size'
         assert args.tensor_model_parallel_size == 1, \
             'SlackPipe prototype requires --tensor-model-parallel-size=1'
         assert args.context_parallel_size == 1, \
@@ -1034,8 +1041,8 @@ def validate_args(args, defaults={}):
 
     if args.virtual_pipeline_model_parallel_size is not None:
         if args.pipeline_schedule == 'slackpipe':
-            assert args.pipeline_model_parallel_size in (1, 2), (
-                'SlackPipe prototype only supports pipeline-model-parallel size 1 or 2'
+            assert args.pipeline_model_parallel_size >= 1, (
+                'SlackPipe requires positive pipeline-model-parallel size'
             )
             args.overlap_p2p_comm = False
             args.align_param_gather = False
@@ -2086,6 +2093,10 @@ def _add_network_size_args(parser):
         "activation_func",
         # types affect docstring
         "pipeline_model_parallel_layout",
+        # SlackPipe options are registered in _add_distributed_args.
+        "pipeline_schedule",
+        "slackpipe_plan",
+        "slackpipe_trace",
         "window_size",
         "window_attn_skip_freq",
         "no_rope_freq",

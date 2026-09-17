@@ -34,7 +34,23 @@ def build_model_manifest(config) -> dict[str, object]:
 
     num_layers = int(config.num_layers)
     layers = []
-    if getattr(config, "heterogeneous_block_specs", False):
+    pattern = getattr(config, "slackpipe_hybrid_pattern", None)
+    if pattern is not None:
+        from .hybrid import HYBRID_TYPES, global_hybrid_pattern
+
+        sequence = global_hybrid_pattern(pattern)
+        if len(sequence) != num_layers:
+            raise ValueError("Hybrid manifest sequence length does not match num_layers")
+        for layer_id, symbol in enumerate(sequence):
+            layers.append(
+                {
+                    "layer_id": layer_id,
+                    "global_layer_id": layer_id,
+                    "layer_type": HYBRID_TYPES[symbol],
+                    "config_class": HYBRID_TYPES[symbol],
+                }
+            )
+    elif getattr(config, "heterogeneous_block_specs", False):
         block_configs = getattr(config, "per_block_parameters")
         if len(block_configs) != num_layers:
             raise ValueError(
@@ -85,6 +101,19 @@ def build_model_manifest(config) -> dict[str, object]:
             )
         },
     }
+    if pattern is not None:
+        manifest["model_config"].update(
+            {
+                name: getattr(config, name)
+                for name in (
+                    "mamba_state_dim",
+                    "mamba_head_dim",
+                    "mamba_num_groups",
+                    "mamba_num_heads",
+                )
+            }
+        )
+        manifest["model_config"]["activation_func"] = config.activation_func.__name__
     manifest["manifest_hash"] = manifest_fingerprint(manifest)
     return manifest
 
@@ -117,7 +146,9 @@ def validate_chunk_layers(plan, chunks, worker: int) -> list[dict]:
     """Check exact global IDs and instantiated heterogeneous modules for TP=1."""
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.utils import unwrap_model
 
+    chunks = unwrap_model(chunks)
     stages = [s for s, w in enumerate(plan.stage_to_worker) if w == worker]
     if len(stages) != len(chunks):
         raise ValueError("SlackPipe model chunk count does not match plan")
@@ -128,6 +159,51 @@ def validate_chunk_layers(plan, chunks, worker: int) -> list[dict]:
         if ids != list(plan.stage_layer_ids(stage)):
             raise ValueError(f"SlackPipe stage {stage} global layer IDs do not match plan: {ids}")
         for layer, layer_id in zip(chunk.decoder.layers, ids):
+            if getattr(chunk.config, "slackpipe_hybrid_pattern", None):
+                from megatron.core.ssm.mamba_layer import MambaLayer
+                from megatron.core.ssm.mlp_layer import MLPLayer
+                from megatron.core.transformer.transformer_layer import TransformerLayer
+
+                expected_type = manifest["layers"][layer_id]["layer_type"]
+                classes = {"mamba": MambaLayer, "attention": TransformerLayer, "mlp": MLPLayer}
+                if type(layer) is not classes[expected_type]:
+                    raise ValueError(f"SlackPipe hybrid layer {layer_id} type mismatch")
+                if expected_type == "attention" and (
+                    not isinstance(layer.self_attention, SelfAttention)
+                    or not isinstance(layer.mlp, IdentityOp)
+                ):
+                    raise ValueError(f"SlackPipe hybrid layer {layer_id} attention class mismatch")
+                if layer.config is not chunk.config:
+                    raise ValueError(f"SlackPipe hybrid layer {layer_id} configuration mismatch")
+                config = chunk.config
+                if expected_type == "mamba":
+                    mixer = layer.mixer
+                    heads = (
+                        config.mamba_num_heads or 2 * config.hidden_size // config.mamba_head_dim
+                    )
+                    if (mixer.d_state, mixer.headdim, mixer.ngroups, mixer.nheads) != (
+                        config.mamba_state_dim,
+                        config.mamba_head_dim,
+                        config.mamba_num_groups,
+                        heads,
+                    ):
+                        raise ValueError(
+                            f"SlackPipe hybrid layer {layer_id} Mamba configuration mismatch"
+                        )
+                elif expected_type == "mlp":
+                    width = config.ffn_hidden_size * (2 if config.gated_linear_unit else 1)
+                    if layer.mlp.linear_fc1.weight.shape != (width, config.hidden_size):
+                        raise ValueError(
+                            f"SlackPipe hybrid layer {layer_id} MLP configuration mismatch"
+                        )
+                else:
+                    width = (
+                        config.num_attention_heads + 2 * config.num_query_groups
+                    ) * config.kv_channels
+                    if layer.self_attention.linear_qkv.weight.shape != (width, config.hidden_size):
+                        raise ValueError(
+                            f"SlackPipe hybrid layer {layer_id} attention configuration mismatch"
+                        )
             if getattr(chunk.config, "heterogeneous_block_specs", False):
                 block = chunk.config.per_block_parameters[layer_id]
                 if block.attention.no_op != isinstance(layer.self_attention, IdentityOp):
@@ -152,6 +228,7 @@ def validate_chunk_layers(plan, chunks, worker: int) -> list[dict]:
                     "stage": stage,
                     "layer_id": layer_id,
                     "config_class": manifest["layers"][layer_id]["config_class"],
+                    "layer_type": manifest["layers"][layer_id]["layer_type"],
                 }
             )
     return records

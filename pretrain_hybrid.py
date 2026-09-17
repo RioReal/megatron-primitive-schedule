@@ -357,3 +357,7 @@ if __name__ == "__main__":
              forward_step,
              store=store,
              )
+    if args.pipeline_schedule == 'slackpipe':
+        from megatron.core.pipeline_parallel.slackpipe.schedule import shutdown_slackpipe_runtime
+
+        shutdown_slackpipe_runtime()

@@ -4,13 +4,21 @@ Select `--pipeline-schedule slackpipe --slackpipe-plan PLAN --slackpipe-transpor
 The default is `nccl-p2p`. The ordinary Megatron schedules do not use this option.
 The solver plan and worker operation order are identical for both transports.
 
-This prototype requires two ranks, cyclic placement, fixed CUDA FP32 tensor
+This prototype requires cyclic placement, fixed CUDA FP32 tensor
 shapes, and NCCL >= 2.29. It uses the installed PyTorch private
 `torch.distributed._symmetric_memory` NCCL backend. It does not require nccl4py,
 a local compiled extension, or host dependencies. The capability and tests were
 checked with PyTorch 2.12.0a0, CUDA 13.2, and NCCL/header 2.29.7. Other builds must
 pass the isolation test before use. Selecting the NCCL symmetric-memory backend
 is a process-wide setting; mixing symmetric-memory backends is unsupported.
+
+Runtime validation currently covers two ranks only. PP=4/N=8 is structurally
+implemented but NOT YET RUN on four GPUs. All ranks create logical-edge groups
+in the same order; nonmembers allocate no windows. The seven logical edges map
+to `(0,1), (1,2), (2,3), (3,0), (0,1), (1,2), (2,3)`, with fourteen directional
+channels total. Channel keys include edge, direction, source and destination.
+RMA peers are subgroup-local indices, not global ranks. The world Gloo barrier
+remains at step completion; warmup barriers involve only each channel's members.
 
 ## Storage and initialization
 

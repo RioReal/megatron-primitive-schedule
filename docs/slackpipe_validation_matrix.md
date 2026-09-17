@@ -1,5 +1,37 @@
 # SlackPipe Validation Coverage
 
+## PP4/Hybrid Extension
+
+PP4 structure is implemented; this host still exposes only two GPUs. The table
+below distinguishes local execution from future four-GPU acceptance tests.
+
+| Feature | Current status |
+| --- | --- |
+| Hybrid manifest and exact type/global ID/range validation | PASS |
+| Native Mamba/attention/MLP PP1 equivalence | PASS, all four max differences 0 |
+| Native Mamba/attention/MLP PP2 P2P and RMA equivalence | PASS in deterministic mode; see caveat below |
+| PP4/N8/B8 stage/chunk/worker mapping | PASS, structural only |
+| Seven P2P groups and fourteen directional RMA channel specifications | PASS, structural only |
+| PP4 cache separation, exact ranges and full CLI argument validation | PASS, structural only |
+| W4/N8/B8 cost_profile.v2 -> CP-SAT -> production plan.v2 parser | PASS, OPTIMAL; not GPU execution |
+| PP4 P2P runtime/numerical equivalence | NOT YET RUN - requires 4 GPUs |
+| PP4 RMA runtime/numerical equivalence | NOT YET RUN - requires 4 GPUs |
+| Nemotron-H 8B allocation/training/benchmark | NOT RUN |
+
+The four-rank test skips with `requires 4 CUDA devices`; this is an intentionally
+uncovered hardware requirement, not a passing result. The Base-8K offline
+architecture adapter and launch scripts need no weight download.
+
+Strict hybrid tests require deterministic Mamba reductions/autotuning, with
+`MAMBA_DETERMINISTIC=1 TRITON_CACHE_AUTOTUNING=0
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` set before imports. Unconstrained runs sometimes
+matched exactly but also produced gradient differences up to `3.052409738302231e-6`
+and post-step differences `5.960464477539063e-8`, despite identical loss.
+The equality assertion was not relaxed; arbitrary nondeterministic kernel runs
+are not claimed to be bitwise reproducible. See the [extension audit](slackpipe_pp4_hybrid.md).
+
+## Original Monorepo Audit
+
 This audit starts at published monorepo checkpoint
 `5078391de5b76ad510c1faf24eab09549b560aad`. The supported validation environment is
 one node, two visible GPUs, NCCL 2.29.7 with working symmetric-memory RMA,

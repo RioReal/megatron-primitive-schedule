@@ -17,14 +17,15 @@ import torch
 import torch.distributed as dist
 
 from .plan import SlackPipePlan, validate_cyclic_placement
+from .topology import logical_edges
 
 
 class SlackPipeRMACommunicator:
-    """Persistent, direction-isolated FP32 mailboxes on exactly two ranks."""
+    """Persistent, direction-isolated FP32 mailboxes on logical edge subgroups."""
 
     def __init__(self, plan: SlackPipePlan):
-        if not dist.is_initialized() or dist.get_world_size() != 2 or plan.num_workers != 2:
-            raise ValueError("SlackPipe nccl-rma requires exactly two distributed ranks")
+        if not dist.is_initialized() or dist.get_world_size() != plan.num_workers:
+            raise ValueError("SlackPipe nccl-rma world size must match plan workers")
         if torch.cuda.nccl.version() < (2, 29, 0):
             raise RuntimeError("SlackPipe nccl-rma requires NCCL >= 2.29")
         validate_cyclic_placement(plan)
@@ -35,6 +36,7 @@ class SlackPipeRMACommunicator:
         self.symm = symm
         self.num_microbatches = plan.num_microbatches
         self.stage_to_worker = plan.stage_to_worker
+        self.edges = logical_edges(plan)
         self.rank = dist.get_rank()
         self.channels = {}
         self.pending = []
@@ -61,11 +63,11 @@ class SlackPipeRMACommunicator:
         self.slot_elements = ((math.prod(shape) * 4 + 4095) // 4096) * 1024
         # PyTorch registers one data window and one internal signal-pad window
         # per allocation/group. Rendezvous of subviews reuses those windows.
-        for stage in range(len(self.stage_to_worker) - 1):
-            if self.stage_to_worker[stage] == self.stage_to_worker[stage + 1]:
-                continue
+        for edge in self.edges:
             for direction in ("forward", "backward"):
-                group = dist.new_group(ranks=[0, 1], backend="nccl")
+                group = dist.new_group(ranks=list(edge.ranks), backend="nccl")
+                if self.rank not in edge.ranks:
+                    continue
                 dist.all_reduce(torch.zeros(1, device=self.device), group=group)
                 storage = self.symm.empty(
                     (self.num_microbatches, self.slot_elements), dtype=dtype, device=self.device
@@ -80,22 +82,26 @@ class SlackPipeRMACommunicator:
                 handles = [self.symm.rendezvous(slot, group) for slot in slots]
                 # Initialize NCCL's lazy RMA resources collectively, outside the
                 # training loop. Only the channel sender writes its source slot.
-                sender = self.stage_to_worker[stage if direction == "forward" else stage + 1]
+                key = edge.channel(direction)
+                _, _, sender, receiver = key
+                peer = receiver if self.rank == sender else sender
+                peer_index = edge.ranks.index(peer)
                 slots[0].zero_()
                 torch.cuda.current_stream().synchronize()
-                dist.barrier(group=self.control)
+                dist.barrier(group=group)
                 if self.rank == sender:
-                    self.symm.put_signal(slots[0], handles[0], 1 - self.rank)
+                    self.symm.put_signal(slots[0], handles[0], peer_index)
                 else:
-                    self.symm.wait_signal(handles[0], 1 - self.rank)
+                    self.symm.wait_signal(handles[0], peer_index)
                 torch.cuda.current_stream().synchronize()
-                self.channels[(direction, (stage, stage + 1))] = {
+                self.channels[key] = {
                     "group": group,
                     "storage": storage,
                     "slots": slots,
                     "handles": handles,
                     "stream": torch.cuda.Stream(),
                     "sender": sender,
+                    "peer_index": peer_index,
                     "position": 0,
                 }
                 self.mailbox_bytes += storage.numel() * storage.element_size()
@@ -155,7 +161,10 @@ class SlackPipeRMACommunicator:
         expected = self.expected_sends if sending else self.expected_receives
         if not self.active or key not in expected:
             raise RuntimeError(f"Unexpected SlackPipe RMA message {key}")
-        channel = self.channels[(direction, edge)]
+        source, destination = (self.stage_to_worker[s] for s in edge)
+        if direction == "backward":
+            source, destination = destination, source
+        channel = self.channels[(edge, direction, source, destination)]
         if (channel["sender"] == self.rank) != sending:
             raise RuntimeError(f"Wrong SlackPipe RMA channel direction: {key}")
         if microbatch != channel["position"]:
@@ -179,7 +188,7 @@ class SlackPipeRMACommunicator:
         with torch.cuda.stream(stream):
             staging = channel["slots"][microbatch]
             staging.copy_(source)
-            self.symm.put_signal(staging, channel["handles"][microbatch], 1 - self.rank)
+            self.symm.put_signal(staging, channel["handles"][microbatch], channel["peer_index"])
             done = torch.cuda.Event()
             done.record()
         self.pending.append((done, source))
@@ -193,7 +202,7 @@ class SlackPipeRMACommunicator:
         # This API consumes ONE further signal, advancing NCCL's cumulative
         # counter. Passing b+1 on every wait would incorrectly overcount.
         with torch.cuda.stream(channel["stream"]):
-            self.symm.wait_signal(channel["handles"][microbatch], 1 - self.rank)
+            self.symm.wait_signal(channel["handles"][microbatch], channel["peer_index"])
         torch.cuda.current_stream().wait_stream(channel["stream"])
         # Give autograd ordinary PyTorch-owned storage. Models may retain their
         # last input after backward/cache teardown; such references must not

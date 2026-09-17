@@ -127,7 +127,11 @@ def forward_backward_slackpipe(
         transport=slackpipe_transport,
     )
     plan = runtime.plan
-    if plan.model_manifest_hash or plan.cost_profile_hash:
+    if (
+        plan.model_manifest_hash or plan.cost_profile_hash
+        or plan.schema_version == "slackpipe.plan.v2"
+        or getattr(config, "slackpipe_hybrid_pattern", None)
+    ):
         from .manifest import validate_chunk_layers, validate_plan_model
 
         for chunk in model_chunks:
@@ -318,6 +322,10 @@ class _CompiledOperation:
     prev_key: Optional[tuple[int, int]]
     next_key: Optional[tuple[int, int]]
     local_index: int
+    previous_worker: Optional[int]
+    next_worker: Optional[int]
+    previous_edge: Optional[tuple[int, int]]
+    next_edge: Optional[tuple[int, int]]
     is_forward: bool
     input_is_remote: bool
     output_is_remote: bool
@@ -396,6 +404,10 @@ class _SlackPipeRuntime:
             prev_key=prev_key,
             next_key=next_key,
             local_index=self.stage_to_local_index[stage],
+            previous_worker=self.plan.stage_to_worker[stage - 1] if prev_key else None,
+            next_worker=self.plan.stage_to_worker[stage + 1] if next_key else None,
+            previous_edge=(stage - 1, stage) if prev_key else None,
+            next_edge=(stage, stage + 1) if next_key else None,
             is_forward=is_forward,
             input_is_remote=previous_is_remote,
             output_is_remote=next_is_remote,
@@ -633,9 +645,9 @@ def _validate_supported_parallelism() -> None:
     tp_size = parallel_state.get_tensor_model_parallel_world_size()
     cp_size = parallel_state.get_context_parallel_world_size()
     dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-    if pp_size not in (1, 2):
+    if pp_size < 1:
         raise ValueError(
-            f"SlackPipe prototype requires pipeline model parallel size 1 or 2, got {pp_size}"
+            f"SlackPipe requires positive pipeline model parallel size, got {pp_size}"
         )
     if tp_size != 1:
         raise ValueError(
@@ -690,6 +702,12 @@ def _rank_trace_path(trace_path: str, pp_rank: int) -> Path:
 
 
 def _validate_unsupported_features(config, forward_only: bool) -> None:
+    if config.params_dtype != torch.float32 or config.pipeline_dtype not in (None, torch.float32):
+        raise ValueError("SlackPipe currently supports FP32 only")
+    if getattr(config, "recompute_granularity", None) is not None:
+        raise ValueError("SlackPipe does not support activation recomputation")
+    if getattr(config, "num_moe_experts", None) or getattr(config, "mtp_num_layers", None):
+        raise ValueError("SlackPipe does not support MoE or MTP")
     if getattr(config, "num_microbatches_with_partial_activation_checkpoints", None) is not None:
         raise ValueError("SlackPipe prototype does not support activation checkpointing")
     if (

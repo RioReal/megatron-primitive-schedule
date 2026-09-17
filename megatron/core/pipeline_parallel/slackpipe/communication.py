@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from .plan import SlackPipePlan
+from .topology import logical_edges
 
 
 @dataclass
@@ -38,13 +39,12 @@ class SlackPipeCommunicator:
         self._send_positions: Dict[Tuple[str, Tuple[int, int]], int] = {}
         self._max_outstanding_sends = 1024
 
-        for stage in range(plan.num_stages - 1):
-            src_worker = plan.stage_to_worker[stage]
-            dst_worker = plan.stage_to_worker[stage + 1]
-            if src_worker == dst_worker:
-                continue
-            ranks = sorted((src_worker, dst_worker))
-            self.edge_groups[(stage, stage + 1)] = dist.new_group(ranks=ranks, backend="nccl")
+        if dist.get_world_size() != plan.num_workers:
+            raise ValueError("SlackPipe transport world size must match plan workers")
+        for edge in logical_edges(plan):
+            group = dist.new_group(ranks=list(edge.ranks), backend="nccl")
+            if self.rank in edge.ranks:
+                self.edge_groups[edge.stages] = group
         self._warm_up_edge_groups()
 
     def has_remote_forward_edge(self, stage: int) -> bool:
