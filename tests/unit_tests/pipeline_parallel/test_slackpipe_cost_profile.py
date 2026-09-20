@@ -74,6 +74,10 @@ def test_aggregate_stage_costs_uses_iteration_medians_and_normalizes_by_microbat
     assert rows[0]["backward_ms_per_op"] == pytest.approx(6.0)
     assert rows[1]["forward_ms_per_op"] == pytest.approx(6.0)
     assert rows[1]["backward_ms_per_op"] == pytest.approx(9.0)
+    assert rows[0]["forward_diagnostics"]["samples_ms"] == [4, 12, 20]
+    assert rows[0]["forward_diagnostics"]["global_iterations"] == [2, 3, 4]
+    assert rows[0]["forward_diagnostics"]["samples_discarded"] == 0
+    assert rows[0]["forward_diagnostics"]["review_required"]
 
 
 def test_build_cost_profile_schema_and_biases():

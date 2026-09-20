@@ -10,7 +10,6 @@ import gc
 import hashlib
 import json
 import os
-import time
 import traceback
 from datetime import timedelta
 from pathlib import Path
@@ -27,17 +26,19 @@ from megatron.core.pipeline_parallel.schedules import (
     end_slackpipe_cost_calibration_iteration,
     get_forward_backward_func,
 )
+from megatron.core.pipeline_parallel.slackpipe.collection import (
+    CollectionOptions,
+    collect_steps,
+    environment_metadata,
+    memory_sample,
+    profiler_settings,
+)
 from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
     aggregate_stage_costs,
     build_heterogeneous_cost_profile,
+    profile_fingerprint,
     stage_role,
     write_cost_profile,
-)
-from megatron.core.pipeline_parallel.slackpipe.figure_trace import (
-    compact_profiler_trace,
-    label_logical_operations,
-    validate_compact_trace,
-    write_compact_trace,
 )
 from megatron.core.pipeline_parallel.slackpipe.hybrid import (
     NEMOTRON_H_8B_MAX_SEQUENCE_LENGTH,
@@ -215,8 +216,7 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
             slackpipe_plan_path=str(args.plan),
             slackpipe_transport=args.transport,
             slackpipe_runtime="fast",
-            slackpipe_enable_nvtx=collect == "trace",
-            slackpipe_trace_path=str(output / "runtime.json") if collect == "trace" else None,
+            slackpipe_enable_nvtx=collect in ("trace", "timeline", "memory"),
         )
         if schedule == "slackpipe"
         else get_forward_backward_func(pp_size=args.pp, vp_size=args.stages // args.pp)
@@ -245,43 +245,36 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
         if not finite.item():
             raise RuntimeError("Non-finite loss/gradient/parameter")
 
-    for _ in range(args.warmups):
-        losses = iteration()
-    # Release transient kernel-autotuning workspace before control collectives.
-    # This is outside all calibration, trace and benchmark measurement windows.
-    torch.cuda.empty_cache()
-    assert_finite(losses)
     events, measured = [], {}
     if collect == "calibrate":
-        for i in range(args.iterations):
+        before_warmup = memory_sample()
+        for _ in range(args.warmups):
+            losses = iteration()
+        assert_finite(losses)
+        measured = dict(
+            collection_mode="calibration",
+            run_id=args.run_id or str(args.output),
+            rank=rank,
+            partition_output=str(output.relative_to(args.output)),
+            stage_layer_ranges=list(plan.stage_layer_ranges),
+            seed=args.seed,
+            optimizer=dict(name="SGD", learning_rate=args.learning_rate),
+            environment=environment_metadata(),
+            profiler=profiler_settings(CollectionOptions()),
+            warmup_iterations=list(range(args.warmups)),
+            measurement_iterations=list(range(args.warmups, args.warmups + args.iterations)),
+            memory_before_warmup=before_warmup,
+            memory_after_warmup=memory_sample(),
+        )
+        for i in measured["measurement_iterations"]:
             begin_slackpipe_cost_calibration_iteration(i)
             try:
                 losses = iteration()
             finally:
                 events.extend(end_slackpipe_cost_calibration_iteration())
             assert_finite(losses)
-    elif collect == "trace":
-        torch.cuda.synchronize()
-        dist.barrier()
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        ) as profiler:
-            with label_logical_operations(args.warmups, rank, args.pp, optimizer):
-                with torch.profiler.record_function(f"ScheduleTrace/step/i{args.warmups}/s-1/b-1"):
-                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                        enable_timing=True
-                    )
-                    t = time.perf_counter()
-                    start.record()
-                    losses = iteration()
-                    end.record()
-                    end.synchronize()
-                    measured[str(args.warmups)] = dict(
-                        cuda_elapsed_ms=start.elapsed_time(end),
-                        wall_elapsed_ms=(time.perf_counter() - t) * 1000,
-                    )
-        raw = output / f"rank{rank}_torch.json"
-        profiler.export_chrome_trace(str(raw))
+        measured["memory_end"] = memory_sample()
+    else:
         metadata = dict(
             pp=args.pp,
             num_stages=args.stages,
@@ -304,40 +297,35 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
             model="Nemotron-H-8B-Base-8K" if not args.tiny else "tiny-hybrid",
             model_sha256=manifest["manifest_hash"],
             host=os.uname().nodename,
+            plan_sha256=(
+                hashlib.sha256(args.plan.read_bytes()).hexdigest()
+                if args.mode != "baseline"
+                else None
+            ),
         )
-        trace = compact_profiler_trace(
-            json.loads(raw.read_text()),
-            rank=rank,
-            mode=args.mode,
+        measured = collect_steps(
+            step=lambda i: iteration(),
+            optimizer=optimizer,
+            options=CollectionOptions(
+                mode="timeline" if collect == "trace" else collect,
+                warmup=args.warmups,
+                iterations=args.iterations,
+                wait=args.profiler_wait,
+                profiler_warmup=args.profiler_warmup,
+                active=args.profiler_active,
+                repeat=args.profiler_repeat,
+                run_id=args.run_id,
+                history_entries=args.memory_history_entries,
+            ),
+            output=output,
+            method=args.mode,
             transport=args.transport if schedule == "slackpipe" else "megatron-p2p",
-            measured_steps=measured,
             config=metadata,
+            plan=plan if schedule == "slackpipe" else None,
+            validate=assert_finite,
         )
-        validate_compact_trace(trace, plan if schedule == "slackpipe" else None)
-        write_compact_trace(output / f"rank{rank}_trace.json", trace)
-    else:
-        dist.barrier()
-        torch.cuda.synchronize()
-        # Only step-boundary events. No calibration, profiler, or per-op sync.
-        pairs = []
-        t = time.perf_counter()
-        for _ in range(args.iterations):
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            start.record()
-            losses = iteration()
-            end.record()
-            pairs.append((start, end))
-        torch.cuda.synchronize()
-        measured = dict(
-            iteration_ms=[s.elapsed_time(e) for s, e in pairs],
-            wall_ms=(time.perf_counter() - t) * 1000,
-            warmups_excluded=args.warmups,
-            calibration=False,
-            tracing=False,
-            dtype=args.precision,
-            loss=[l["loss"].item() for l in losses],
-        )
-    assert_finite(losses)
+        measured["iteration_ms"] = [s["cuda_elapsed_ms"] for s in measured["samples"]]
+        measured["wall_ms"] = measured["continuous_wall_ms"]
     write_json(output / f"result.rank{rank}.json", measured)
     gathered = [None] * args.pp
     dist.all_gather_object(gathered, events)
@@ -353,7 +341,7 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("calibrate", "benchmark", "trace"))
+    parser.add_argument("action", choices=("calibrate", "benchmark", "trace", "timeline", "memory"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--mode", choices=("baseline", "partition", "slackpipe"), default="baseline"
@@ -361,11 +349,19 @@ def main() -> None:
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--transport", choices=("nccl-p2p", "nccl-rma"), default="nccl-p2p")
     parser.add_argument("--seq-length", type=int, default=1024)
-    parser.add_argument("--warmups", type=int, default=5)
+    parser.add_argument("--warmups", type=int, default=20)
+    parser.add_argument("--profiler-wait", type=int, default=2)
+    parser.add_argument("--profiler-warmup", type=int, default=2)
+    parser.add_argument("--profiler-active", type=int, default=3)
+    parser.add_argument("--profiler-repeat", type=int, default=3)
+    parser.add_argument("--memory-history-entries", type=int, default=100000)
+    parser.add_argument("--run-id")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     parser.add_argument("--tiny", action="store_true")
     args = parser.parse_args()
+    if list(args.output.glob("result.rank*.json")) or (args.output / "cost_profile.json").exists():
+        parser.error("Refusing to overwrite an existing collection; use a fresh --output")
     args.pp = int(os.environ["WORLD_SIZE"])
     if (not args.tiny and args.pp != 4) or args.pp not in (2, 4):
         parser.error("real 8B requires four ranks; --tiny supports two or four")
@@ -439,8 +435,8 @@ def main() -> None:
                     events,
                     layer_split=plan.layer_split,
                     num_microbatches=args.num_microbatches,
-                    iteration_start=0,
-                    iteration_end=args.iterations - 1,
+                    iteration_start=args.warmups,
+                    iteration_end=args.warmups + args.iterations - 1,
                 )
                 for s, row in enumerate(rows):
                     row.update(
@@ -463,6 +459,14 @@ def main() -> None:
                 },
                 parallel_config=dict(pp=args.pp, vpp=2, tp=1, dp=1, cp=1),
             )
+            profile["collection"] = dict(
+                collection_mode="calibration",
+                rank_partition_metadata=[
+                    json.loads(path.read_text())
+                    for path in sorted(args.output.glob("partition*/result.rank*.json"))
+                ],
+            )
+            profile["cost_profile_hash"] = profile_fingerprint(profile)
             write_cost_profile(args.output / "cost_profile.json", profile)
             write_json(args.output / "observations.json", observed)
             write_json(

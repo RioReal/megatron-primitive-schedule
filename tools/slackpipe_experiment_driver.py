@@ -21,7 +21,6 @@ import random
 import shlex
 import statistics
 import subprocess
-import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -369,6 +368,7 @@ def calibrate(
     events = root / "calibration" / "calibration_events.json"
     meta = {
         "kind": "calibration",
+        "collection_schema": "slackpipe.collection.v1",
         "config": asdict(cfg),
         "seed_plan_digest": file_digest(seed_plan),
         "warmups": warmups,
@@ -377,16 +377,17 @@ def calibrate(
     meta_path = profile.with_suffix(profile.suffix + ".meta.json")
     if stage_done(meta_path, meta, [profile, events], force):
         return profile
+    if profile.exists() or (root / "calibration").exists():
+        raise RuntimeError("Refusing to replace calibration inputs; use a fresh --output-dir")
     script = (
         f"cd {CONTAINER_REPO} && "
-        f"rm -rf {container_path(root / 'calibration')} && "
         f"mkdir -p {container_path(root / 'calibration')} {container_path(root / 'cost_profiles')} && "
         "CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run "
         f"--master_port {next_port(cfg.name, 'calibration')} --nproc_per_node=2 "
         "tests/unit_tests/pipeline_parallel/slackpipe_perf_benchmark.py "
         f"--plan {container_path(seed_plan)} "
         f"--output-dir {container_path(root / 'calibration')} "
-        "--warmup-iterations 5 --iterations 20 "
+        "--warmup-iterations 20 --iterations 20 "
         f"--hidden-size {cfg.hidden_size} --num-attention-heads {cfg.num_attention_heads} "
         f"--seq-length {cfg.seq_length} --micro-batch-size {cfg.micro_batch_size} "
         f"--vocab-size {cfg.vocab_size} --learning-rate 0 "
@@ -475,6 +476,7 @@ def benchmark_once(
     summary = out_dir / "benchmark_summary.json"
     meta = {
         "kind": "benchmark",
+        "collection_schema": "slackpipe.collection.v1",
         "config": asdict(cfg),
         "plan_digest": file_digest(plan),
         "label": label,
@@ -487,8 +489,12 @@ def benchmark_once(
     meta_path = summary.with_suffix(summary.suffix + ".meta.json")
     if stage_done(meta_path, meta, [summary], force):
         return summary
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise RuntimeError(
+            f"Refusing to overwrite experiment data in {out_dir}; use a fresh --output-dir"
+        )
     script = (
-        f"cd {CONTAINER_REPO} && rm -rf {container_path(out_dir)} && "
+        f"cd {CONTAINER_REPO} && "
         f"timeout --kill-after=30s {timeout_seconds}s "
         "env CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run "
         f"--master_port {next_port(cfg.name, label, rep)} --nproc_per_node=2 "
@@ -531,10 +537,14 @@ def extract_global_times(summary_path: Path, mode_name: str) -> tuple[list[float
     summary = read_json(summary_path)
     stats = summary["modes"][mode_name]
     rank_times = [rank["iteration_cuda_times_ms"] for rank in stats["rank_results"]]
+    if not rank_times or len({len(v) for v in rank_times}) != 1:
+        raise ValueError("Missing or unequal rank sample lengths")
     return [max(values) for values in zip(*rank_times)], summary
 
 
-def summarize_samples(samples_by_rep: list[list[float]]) -> dict[str, float | int | str]:
+def summarize_samples(samples_by_rep: list[list[float]]) -> dict[str, Any]:
+    if not samples_by_rep or any(not rep for rep in samples_by_rep):
+        raise ValueError("Every independent run must contain samples")
     samples = [value for rep in samples_by_rep for value in rep]
     rep_means = [statistics.fmean(rep) for rep in samples_by_rep if rep]
     mean = statistics.fmean(samples)
@@ -546,6 +556,9 @@ def summarize_samples(samples_by_rep: list[list[float]]) -> dict[str, float | in
         "median_ms": statistics.median(samples),
         "stddev_ms": stddev,
         "rep_mean_stddev_ms": rep_stddev,
+        "run_means_ms": rep_means,
+        "within_run_stddev_ms": [statistics.pstdev(rep) for rep in samples_by_rep],
+        "all_samples_by_run": samples_by_rep,
         "ci95_ms": ci95,
         "cv": stddev / mean if mean else 0.0,
         "min_ms": min(samples),
@@ -979,11 +992,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", action="append", help="Run only the named config; repeatable.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--seed", type=int, default=20260916)
-    parser.add_argument("--benchmark-warmups", type=int, default=5)
+    parser.add_argument("--benchmark-warmups", type=int, default=20)
     parser.add_argument("--benchmark-iterations", type=int, default=50)
     parser.add_argument("--benchmark-timeout", type=int, default=600)
     parser.add_argument("--repetitions", type=int, default=3)
-    parser.add_argument("--calibration-warmups", type=int, default=5)
+    parser.add_argument("--calibration-warmups", type=int, default=20)
     parser.add_argument("--calibration-iterations", type=int, default=10)
     parser.add_argument("--solver-time-limit", type=float, default=30.0)
     parser.add_argument("--skip-regressions", action="store_true")

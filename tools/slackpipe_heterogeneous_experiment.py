@@ -86,7 +86,7 @@ def select_partitions(manifest, minimum=6):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--warmup-iterations", type=int, default=5)
+    parser.add_argument("--warmup-iterations", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-attention-heads", type=int, default=4)
@@ -98,6 +98,10 @@ def main():
         help="calibrate the tiny native Mamba/attention/MLP fixture",
     )
     args = parser.parse_args()
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        parser.error("Refusing to overwrite calibration data; use a fresh --output-dir")
+    if args.warmup_iterations < 1:
+        parser.error("at least one training warmup is required")
     if args.iterations < 10:
         parser.error("at least 10 calibration iterations are required")
     args.num_layers, args.micro_batch_size, args.vocab_size = 12, 1, 128
@@ -144,7 +148,7 @@ def main():
     Utils.initialize_model_parallel(1, 2, virtual_pipeline_model_parallel_size=2)
     parallel_state.set_virtual_pipeline_model_parallel_world_size(2)
     dist.barrier()
-    observed, raw_events, actual_layers = [], [], []
+    observed, raw_events, actual_layers, collection_metadata = [], [], [], []
     try:
         for partition_id, cuts in enumerate(partitions):
             split = [b - a for a, b in zip(cuts, cuts[1:])]
@@ -170,17 +174,38 @@ def main():
                 bench._logical_params(model).values(), lr=args.learning_rate
             )
             batches = bench._make_batches(args)
+            step = bench.make_training_step(args, mode, model, optimizer, batches)
+            before_warmup = bench.memory_sample()
             for _ in range(args.warmup_iterations):
-                bench._run_iteration(args, mode, model, optimizer, batches)
+                losses = step(0)
+            bench._assert_finite(losses, bench._logical_params(model))
+            after_warmup = bench.memory_sample()
             events = []
-            for iteration in range(args.iterations):
+            for iteration in range(
+                args.warmup_iterations, args.warmup_iterations + args.iterations
+            ):
                 begin_slackpipe_cost_calibration_iteration(iteration)
                 try:
-                    bench._run_iteration(args, mode, model, optimizer, batches)
+                    losses = step(iteration)
                 finally:
                     events.extend(end_slackpipe_cost_calibration_iteration())
+            bench._assert_finite(losses, bench._logical_params(model))
             gathered = [None] * 2
             dist.all_gather_object(gathered, events)
+            rank_metadata = [None] * 2
+            dist.all_gather_object(
+                rank_metadata,
+                dict(
+                    rank=rank,
+                    partition=partition_id,
+                    cuts=cuts,
+                    environment=bench.environment_metadata(),
+                    memory_before_warmup=before_warmup,
+                    memory_after_warmup=after_warmup,
+                    memory_end=bench.memory_sample(),
+                ),
+            )
+            collection_metadata.extend(rank_metadata)
             if rank == 0:
                 events = [e for worker in gathered for e in worker]
                 raw_events.append({"cuts": cuts, "events": events})
@@ -188,8 +213,8 @@ def main():
                     events,
                     layer_split=split,
                     num_microbatches=4,
-                    iteration_start=0,
-                    iteration_end=args.iterations - 1,
+                    iteration_start=args.warmup_iterations,
+                    iteration_end=args.warmup_iterations + args.iterations - 1,
                 )
                 for s, row in enumerate(rows):
                     layer_classes = [
@@ -205,7 +230,7 @@ def main():
                     )
                 observed.extend(rows)
                 print(f"CALIBRATED {cuts}: {rows}", flush=True)
-            del model, optimizer, batches
+            del model, optimizer, batches, step
             gc.collect()
             torch.cuda.empty_cache()
             dist.barrier()
@@ -227,6 +252,14 @@ def main():
                 parallel_config={"pp": 2, "vpp": 2, "tp": 1, "dp": 1, "cp": 1},
             )
             profile["calibration"] = {
+                "collection_mode": "calibration",
+                "run_id": str(args.output_dir),
+                "rank_partition_metadata": collection_metadata,
+                "environment": bench.environment_metadata(),
+                "profiler": bench.profiler_settings(bench.CollectionOptions()),
+                "measurement_global_iterations": list(
+                    range(args.warmup_iterations, args.warmup_iterations + args.iterations)
+                ),
                 "schedule": "megatron_interleaved_1f1b",
                 "partitions": partitions,
                 "warmup_iterations": args.warmup_iterations,

@@ -40,6 +40,7 @@ STAGES = (
     "slackpipe-smoke",
     "benchmark",
     "trace",
+    "memory",
 )
 REQUIRES = {
     "env": (),
@@ -50,6 +51,7 @@ REQUIRES = {
     "slackpipe-smoke": ("solve",),
     "benchmark": ("slackpipe-smoke",),
     "trace": ("benchmark",),
+    "memory": ("slackpipe-smoke",),
 }
 DETERMINISTIC = dict(
     OMP_NUM_THREADS="1",
@@ -283,14 +285,27 @@ def main() -> None:
     parser.add_argument("--solver-seconds", type=int, default=300)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--minimum-free-gib", type=float, default=35)
-    parser.add_argument("--warmups", type=int, default=5)
+    parser.add_argument("--warmups", type=int, default=20)
+    parser.add_argument("--profiler-wait", type=int, default=2)
+    parser.add_argument("--profiler-warmup", type=int, default=2)
+    parser.add_argument("--profiler-active", type=int, default=3)
+    parser.add_argument("--profiler-repeat", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument(
+        "--runs", type=int, default=3, help="Independent fresh-process benchmark repetitions"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.stage == "nccl-sanity":
         nccl_sanity()
         return
-    if args.warmups < 1 or args.iterations < 10 or args.timeout < 1 or args.solver_seconds < 1:
+    if (
+        args.warmups < 1
+        or args.iterations < 10
+        or args.timeout < 1
+        or args.solver_seconds < 1
+        or args.runs < 1
+    ):
         parser.error("Require warmups>=1, iterations>=10 and positive timeouts")
     args.output = args.output.resolve()
     output, stage = args.output, args.stage
@@ -439,8 +454,13 @@ def main() -> None:
                 else ("baseline", "slackpipe")
             )
         )
-        for mode in modes:
+        jobs = [
+            (mode, rep) for rep in range(args.runs if stage == "benchmark" else 1) for mode in modes
+        ]
+        for mode, rep in jobs:
             directory = output / "calibration" if stage == "calibrate" else output / stage / mode
+            if stage == "benchmark":
+                directory = directory / f"run{rep:03d}"
             execute(
                 torchrun
                 + [
@@ -461,10 +481,18 @@ def main() -> None:
                     str(args.warmups),
                     "--iterations",
                     str(args.iterations),
+                    "--profiler-wait",
+                    str(args.profiler_wait),
+                    "--profiler-warmup",
+                    str(args.profiler_warmup),
+                    "--profiler-active",
+                    str(args.profiler_active),
+                    "--profiler-repeat",
+                    str(args.profiler_repeat),
                 ],
-                f"{stage}-{mode}",
+                f"{stage}-{mode}-run{rep:03d}",
             )
-            artifacts.extend(directory.glob("*.json"))
+            artifacts.extend(directory.rglob("*.json"))
         if stage == "trace":
             execute(
                 [
@@ -482,7 +510,7 @@ def main() -> None:
                     "--report",
                     output / "trace/figure_report.json",
                     "--iteration",
-                    str(args.warmups),
+                    str(args.warmups + args.profiler_wait + args.profiler_warmup),
                     "--title",
                     "Nemotron-H 8B: PP=4, N=8, B=8",
                 ],
@@ -491,17 +519,30 @@ def main() -> None:
         if stage == "benchmark":
             summary = {}
             for mode in modes:
-                results = [
-                    json.loads((output / stage / mode / f"result.rank{r}.json").read_text())
-                    for r in range(4)
-                ]
-                if any(len(r["iteration_ms"]) != args.iterations for r in results):
-                    raise RuntimeError("Incomplete benchmark samples")
-                times = [max(t) for t in zip(*(r["iteration_ms"] for r in results))]
+                from megatron.core.pipeline_parallel.slackpipe.collection import (
+                    summarize_rank_samples,
+                )
+
+                runs = []
+                for rep in range(args.runs):
+                    results = [
+                        json.loads(
+                            (
+                                output / stage / mode / f"run{rep:03d}" / f"result.rank{r}.json"
+                            ).read_text()
+                        )
+                        for r in range(4)
+                    ]
+                    if any(len(r["iteration_ms"]) != args.iterations for r in results):
+                        raise RuntimeError("Incomplete benchmark samples")
+                    runs.append(summarize_rank_samples(results))
+                means = [r["mean_ms"] for r in runs]
                 summary[mode] = dict(
-                    max_rank_iteration_ms=times,
-                    mean_ms=statistics.fmean(times),
-                    median_ms=statistics.median(times),
+                    runs=runs,
+                    run_means_ms=means,
+                    mean_ms=statistics.fmean(means),
+                    run_mean_stddev_ms=statistics.stdev(means) if len(means) > 1 else None,
+                    within_run_stddev_ms=[r["stddev_ms"] for r in runs],
                 )
             path = output / stage / "summary.json"
             write_json(path, dict(context=expected, modes=summary, warmups_excluded=args.warmups))
@@ -511,7 +552,17 @@ def main() -> None:
     write_json(
         output / "receipts" / f"{stage}.json",
         dict(
-            context=expected, artifacts={str(p.relative_to(output)): digest(p) for p in artifacts}
+            context=expected,
+            collection_policy=dict(
+                warmups=args.warmups,
+                iterations=args.iterations,
+                runs=args.runs,
+                wait=args.profiler_wait,
+                profiler_warmup=args.profiler_warmup,
+                active=args.profiler_active,
+                repeat=args.profiler_repeat,
+            ),
+            artifacts={str(p.relative_to(output)): digest(p) for p in artifacts},
         ),
     )
     print(f"Passed {stage}. Artifacts: {output}", flush=True)

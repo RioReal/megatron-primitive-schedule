@@ -10,6 +10,7 @@ interleaved 1F1B, and SlackPipe using one generated plan.
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import statistics
@@ -33,6 +34,14 @@ from megatron.core.pipeline_parallel.schedules import (
     begin_slackpipe_cost_calibration_iteration,
     end_slackpipe_cost_calibration_iteration,
     get_forward_backward_func,
+)
+from megatron.core.pipeline_parallel.slackpipe.collection import (
+    CollectionOptions,
+    collect_steps,
+    environment_metadata,
+    memory_sample,
+    profiler_settings,
+    summarize_rank_samples,
 )
 from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
     build_cost_profile,
@@ -154,29 +163,26 @@ def _build_model(args, mode):
     )
     for chunk in model:
         chunk.train()
-    if getattr(args, "heterogeneous_config", None):
-        # Keep each logical parameter identical across different PP/VPP cuts.
-        import hashlib
+    # Same global parameter initialization for homogeneous and heterogeneous cuts.
+    from tests.unit_tests.pipeline_parallel.test_slackpipe_model_construction import (
+        _logical_named_parameters,
+    )
 
-        from tests.unit_tests.pipeline_parallel.test_slackpipe_model_construction import (
-            _logical_named_parameters,
-        )
-
-        with torch.no_grad():
-            for name, param in _logical_named_parameters(model).items():
-                generator = torch.Generator(device=param.device)
-                generator.manual_seed(
-                    int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], "little") + args.seed
-                )
-                if "layer_norm" in name or "layernorm" in name:
-                    param.fill_(0.0 if name.endswith("bias") else 1.0)
-                elif name.endswith("bias"):
-                    param.zero_()
-                else:
-                    std = 0.02
-                    if name.endswith(("linear_proj.weight", "linear_fc2.weight")):
-                        std /= (2 * args.num_layers) ** 0.5
-                    param.normal_(0.0, std, generator=generator)
+    with torch.no_grad():
+        for name, param in _logical_named_parameters(model).items():
+            generator = torch.Generator(device=param.device)
+            generator.manual_seed(
+                int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], "little") + args.seed
+            )
+            if "layer_norm" in name or "layernorm" in name:
+                param.fill_(0.0 if name.endswith("bias") else 1.0)
+            elif name.endswith("bias"):
+                param.zero_()
+            else:
+                std = 0.02
+                if name.endswith(("linear_proj.weight", "linear_fc2.weight")):
+                    std /= (2 * args.num_layers) ** 0.5
+                param.normal_(0.0, std, generator=generator)
     return model
 
 
@@ -250,8 +256,8 @@ def _assert_finite(losses, params):
         )
 
 
-def _run_iteration(args, mode, model, optimizer, batches, profile_path=None, trace_path=None):
-    optimizer.zero_grad(set_to_none=True)
+def make_training_step(args, mode, model, optimizer, batches, profile_path=None, trace_path=None):
+    """Build once; benchmark, profiler and calibration execute the same full step."""
     if mode["schedule"] == "slackpipe":
         forward_backward = get_forward_backward_func(
             pipeline_schedule="slackpipe",
@@ -264,19 +270,27 @@ def _run_iteration(args, mode, model, optimizer, batches, profile_path=None, tra
         )
     else:
         forward_backward = get_forward_backward_func(pp_size=2, vp_size=2)
-    losses = forward_backward(
-        forward_step_func=_forward_step_func,
-        data_iterator=[_batch_iterator(batches) for _ in range(len(model))],
-        model=model,
-        num_microbatches=args.num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        forward_only=False,
-    )
-    params = _logical_params(model)
-    _assert_finite(losses, params)
-    optimizer.step()
-    _assert_finite([], params)
+
+    def step(iteration):
+        optimizer.zero_grad(set_to_none=True)
+        losses = forward_backward(
+            forward_step_func=_forward_step_func,
+            data_iterator=[_batch_iterator(batches) for _ in range(len(model))],
+            model=model,
+            num_microbatches=args.num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            forward_only=False,
+        )
+        optimizer.step()
+        return losses
+
+    return step
+
+
+def _run_iteration(args, mode, model, optimizer, batches, profile_path=None, trace_path=None):
+    losses = make_training_step(args, mode, model, optimizer, batches, profile_path, trace_path)(0)
+    _assert_finite(losses, _logical_params(model))
     return losses
 
 
@@ -329,46 +343,47 @@ def _benchmark_mode(args, mode, rank):
         transport_construction_seconds = time.perf_counter() - started
         transport_construction_device_bytes = free_before - torch.cuda.mem_get_info()[0]
 
-    for _ in range(args.warmup_iterations):
-        _run_iteration(args, mode, model, optimizer, batches)
-
-    profile_path = None
-    trace_path = None
-    if mode["schedule"] == "slackpipe":
-        profile_path = args.output_dir / "slackpipe_operation_profile.json"
-        trace_path = args.output_dir / "slackpipe_trace.json"
-        _run_iteration(args, mode, model, optimizer, batches, profile_path, trace_path)
-
-    dist.barrier()
-    torch.cuda.synchronize()
-    events = []
-    cpu_times_ms = []
-    total_cpu_start = time.perf_counter()
-    for _ in range(args.iterations):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        cpu_start = time.perf_counter()
-        measured_profile_path = None
-        measured_trace_path = None
-        if mode["schedule"] == "slackpipe":
-            if args.profile_measured_iterations:
-                measured_profile_path = args.output_dir / "measured_slackpipe_profile.json"
-            if args.trace_measured_iterations:
-                measured_trace_path = args.output_dir / "measured_slackpipe_trace.json"
-        _run_iteration(
-            args, mode, model, optimizer, batches, measured_profile_path, measured_trace_path
-        )
-        cpu_times_ms.append((time.perf_counter() - cpu_start) * 1000.0)
-        end_event.record()
-        events.append((start_event, end_event))
-    torch.cuda.synchronize()
-    total_cpu_ms = (time.perf_counter() - total_cpu_start) * 1000.0
-    cuda_times_ms = [start.elapsed_time(end) for start, end in events]
+    params = _logical_params(model)
+    collection = collect_steps(
+        step=make_training_step(args, mode, model, optimizer, batches),
+        optimizer=optimizer,
+        options=CollectionOptions(
+            warmup=args.warmup_iterations, iterations=args.iterations, run_id=args.run_id
+        ),
+        output=args.output_dir,
+        method=mode["name"],
+        transport=args.slackpipe_transport if mode["schedule"] == "slackpipe" else "megatron-p2p",
+        config=dict(
+            pp=2,
+            num_layers=args.num_layers,
+            num_microbatches=args.num_microbatches,
+            layout=mode["layout"],
+            hidden_size=args.hidden_size,
+            heads=args.num_attention_heads,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            vocab_size=args.vocab_size,
+            seed=args.seed,
+            learning_rate=args.learning_rate,
+            model_sha256=(
+                hashlib.sha256(args.heterogeneous_config.read_bytes()).hexdigest()
+                if args.heterogeneous_config
+                else "homogeneous"
+            ),
+            initialization="per-global-logical-parameter seed; partition independent",
+            dtype="fp32",
+            plan_sha256=hashlib.sha256(args.plan.read_bytes()).hexdigest(),
+        ),
+        validate=lambda losses: _assert_finite(losses, params),
+    )
+    cuda_times_ms = [s["cuda_elapsed_ms"] for s in collection["samples"]]
+    cpu_times_ms = [s["cpu_dispatch_ms"] for s in collection["samples"]]
+    total_cpu_ms = collection["continuous_wall_ms"]
     free_device_bytes, total_device_bytes = torch.cuda.mem_get_info()
 
     result = {
         "mode": mode["name"],
+        "collection": collection,
         "rank": rank,
         "layout": mode["layout"],
         "schedule": mode["schedule"],
@@ -407,19 +422,44 @@ def _calibrate_cost_profile(args, plan, rank):
     model = _build_model(args, mode)
     optimizer = torch.optim.SGD(_logical_params(model).values(), lr=args.learning_rate)
     batches = _make_batches(args)
+    step = make_training_step(args, mode, model, optimizer, batches)
+    before_warmup = memory_sample()
     for _ in range(args.calibration_warmup_iterations):
-        _run_iteration(args, mode, model, optimizer, batches)
+        losses = step(0)
+    _assert_finite(losses, _logical_params(model))
+    provenance = dict(
+        collection_mode="calibration",
+        rank=rank,
+        run_id=args.run_id or str(args.output_dir),
+        seed=args.seed,
+        optimizer=dict(name="SGD", learning_rate=args.learning_rate),
+        environment=environment_metadata(),
+        profiler=profiler_settings(CollectionOptions()),
+        memory_before_warmup=before_warmup,
+        memory_after_warmup=memory_sample(),
+        warmup_iterations=list(range(args.calibration_warmup_iterations)),
+        measurement_iterations=list(
+            range(
+                args.calibration_warmup_iterations,
+                args.calibration_warmup_iterations + args.calibration_iterations,
+            )
+        ),
+    )
 
     events = []
-    for iteration in range(args.calibration_iterations):
+    for iteration in provenance["measurement_iterations"]:
         begin_slackpipe_cost_calibration_iteration(iteration)
         try:
-            _run_iteration(args, mode, model, optimizer, batches)
+            losses = step(iteration)
         finally:
             events.extend(end_slackpipe_cost_calibration_iteration())
+    _assert_finite(losses, _logical_params(model))
 
     gathered = [None for _ in range(dist.get_world_size())]
     dist.all_gather_object(gathered, events)
+    provenance["memory_end"] = memory_sample()
+    all_provenance = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(all_provenance, provenance)
     if rank == 0:
         all_events = [event for rank_events in gathered for event in rank_events]
         profile = build_cost_profile(
@@ -437,11 +477,12 @@ def _calibrate_cost_profile(args, plan, rank):
             parallel_config={"pp": 2, "vpp": 2, "tp": 1, "dp": 1, "cp": 1},
             layer_split=list(plan.layer_split),
             num_microbatches=args.num_microbatches,
-            iteration_start=0,
-            iteration_end=args.calibration_iterations - 1,
+            iteration_start=args.calibration_warmup_iterations,
+            iteration_end=args.calibration_warmup_iterations + args.calibration_iterations - 1,
             estimator=args.shared_slope_estimator,
             percentile_value=args.shared_slope_percentile,
         )
+        profile["collection"] = dict(provenance, rank_metadata=all_provenance)
         write_cost_profile(args.emit_cost_profile, profile)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         (args.output_dir / "calibration_events.json").write_text(
@@ -488,7 +529,9 @@ def _write_summary(args, all_results, plan):
     tokens_per_iteration = samples_per_iteration * args.seq_length
     for mode_name, rank_results in by_mode.items():
         per_rank_times = [r["iteration_cuda_times_ms"] for r in rank_results]
+        collected_summary = summarize_rank_samples([r["collection"] for r in rank_results])
         global_times = [max(values) for values in zip(*per_rank_times)]
+        assert global_times == collected_summary["max_rank_iteration_ms"]
         stats = _stats(global_times)
         mean_seconds = stats["mean_ms"] / 1000.0
         stats["samples_per_second"] = samples_per_iteration / mean_seconds
@@ -552,7 +595,8 @@ def main():
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--heterogeneous-config", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--warmup-iterations", type=int, default=5)
+    parser.add_argument("--warmup-iterations", type=int, default=20)
+    parser.add_argument("--run-id")
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--num-attention-heads", type=int, default=8)
@@ -572,7 +616,7 @@ def main():
     parser.add_argument("--profile-measured-iterations", action="store_true")
     parser.add_argument("--trace-measured-iterations", action="store_true")
     parser.add_argument("--emit-cost-profile", type=Path, default=None)
-    parser.add_argument("--calibration-warmup-iterations", type=int, default=5)
+    parser.add_argument("--calibration-warmup-iterations", type=int, default=20)
     parser.add_argument("--calibration-iterations", type=int, default=10)
     parser.add_argument(
         "--shared-slope-estimator", choices=["min", "median", "percentile"], default="min"
@@ -589,6 +633,24 @@ def main():
         help="Run only one benchmark mode. Intended for short profiler captures.",
     )
     args = parser.parse_args()
+    if (args.output_dir / "benchmark_summary.json").exists() or (
+        args.emit_cost_profile is not None and args.emit_cost_profile.exists()
+    ):
+        parser.error("Refusing to overwrite recorded results; use a fresh output directory")
+    if args.profile_measured_iterations or args.trace_measured_iterations:
+        parser.error(
+            "Benchmark is unprofiled; use tools.capture_schedule_trace --collection-mode timeline or memory"
+        )
+    if (
+        min(
+            args.warmup_iterations,
+            args.iterations,
+            args.calibration_warmup_iterations,
+            args.calibration_iterations,
+        )
+        < 1
+    ):
+        parser.error("Warmup and measurement lengths must be positive")
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])

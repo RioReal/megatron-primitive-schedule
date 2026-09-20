@@ -207,6 +207,12 @@ Consult each tool's `--help` before launching an experiment campaign.
 
 For trace capture and plotting, see the
 [figure workflow](megatron/core/pipeline_parallel/slackpipe/README.figure_trace.md).
+The [collection guide](docs/slackpipe_collection.md) documents separate unprofiled
+benchmark, lightweight timeline and short memory-diagnosis runs; shared full-step
+warmup; per-cycle raw captures; allocation provenance; and interval-union plots.
+Default diagnostic policy is 20 training warmups followed by profiler cycles
+`wait=2,warmup=2,active=3,repeat=3`. All samples and actual global iteration IDs
+are retained; profiling timings are not benchmark speedups.
 Generated plans, profiles, experiment outputs, and raw traces are ignored and
 must be regenerated; the small solver-order plans under test fixtures are
 intentional regression inputs, not benchmark artifacts.

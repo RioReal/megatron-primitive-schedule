@@ -69,7 +69,7 @@ def aggregate_stage_costs(
     num_microbatches: int,
     iteration_start: int,
     iteration_end: int,
-) -> list[dict[str, float]]:
+) -> list[dict[str, object]]:
     """Aggregate synchronized compute events into per-stage median costs."""
 
     if num_microbatches <= 0:
@@ -112,6 +112,21 @@ def aggregate_stage_costs(
         median_backward = statistics.median(backward_totals)
         forward_op = median_forward / num_microbatches
         backward_op = median_backward / num_microbatches
+
+        def diagnostics(samples):
+            mean = statistics.fmean(samples)
+            cv = statistics.pstdev(samples) / mean if mean else 0.0
+            return dict(
+                samples_ms=samples,
+                global_iterations=iterations,
+                min_ms=min(samples),
+                max_ms=max(samples),
+                cv=cv,
+                review_required=cv > 0.1,
+                allocation_attribution="unknown: synchronized wall time includes dispatch/allocation stalls; use separate memory diagnosis",
+                samples_discarded=0,
+            )
+
         rows.append(
             {
                 "stage": stage,
@@ -121,6 +136,8 @@ def aggregate_stage_costs(
                 "forward_ms_per_op": forward_op,
                 "backward_ms_per_op": backward_op,
                 "backward_forward_ratio": backward_op / forward_op if forward_op else None,
+                "forward_diagnostics": diagnostics(forward_totals),
+                "backward_diagnostics": diagnostics(backward_totals),
             }
         )
     return rows
@@ -173,8 +190,21 @@ def build_cost_profile(
         "bias_fwd": bias_fwd,
         "bias_bwd": bias_bwd,
         "observed_stages": observed,
+        "measurement_definition": calibration_measurement_definition(),
         "units": "milliseconds",
     }
+
+
+def calibration_measurement_definition() -> dict:
+    return dict(
+        source="ordinary Megatron synchronized stage-call wall time, not profiler operation envelopes",
+        includes="CPU dispatch, compute, allocation/cache stalls inside the call and completion wait",
+        excludes="explicit pipeline P2P calls outside stage compute and optimizer step",
+        synchronization="device synchronization before/after each calibrated stage call; separate diagnostic run",
+        estimator="median across iteration totals divided by microbatch count; no samples discarded",
+        allocation_stability="not established by timing alone; review sample CV and pair with a separate memory capture",
+        kernel_union_substitution=False,
+    )
 
 
 def stage_role(stage: int, num_stages: int) -> str:
@@ -366,6 +396,8 @@ def build_heterogeneous_cost_profile(
     profile = {
         "schema_version": SLACKPIPE_COST_PROFILE_SCHEMA_VERSION_V2,
         "model_manifest_hash": model_manifest.get("manifest_hash"),
+        "measurement_definition": calibration_measurement_definition(),
+        "observed_stages": [dict(row) for row in observed_stage_rows],
         "model_config": dict(model_config),
         "parallel_config": dict(parallel_config),
         "class_costs_us": {

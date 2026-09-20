@@ -193,12 +193,14 @@ only at iteration boundaries. Calibration, per-operation profiling and trace
 capture are disabled. Finite checks run outside the timing window. The summary
 reports each step's maximum rank time and mean/median across measured steps.
 
-Trace capture runs separately after benchmark success, for one iteration after
-the requested warmups. It reuses `figure_trace.label_logical_operations`,
+Trace capture runs separately after benchmark success, with 20 training warmups
+and three profiler cycles (wait=2, warmup=2, active=3) by default. It reuses `figure_trace.label_logical_operations`,
 `compact_profiler_trace`, `validate_compact_trace`, and `tools.plot_schedule_trace`.
-There are per-rank raw torch traces, compact envelope JSON, validated SlackPipe
-worker-order traces, and a paired baseline/SlackPipe PDF/PNG. No multi-node clock
+There are per-cycle per-rank raw torch traces, compact activity/envelope JSON,
+validated SlackPipe worker order, and a paired baseline/SlackPipe PDF/PNG. No multi-node clock
 alignment is attempted.
+See the [collection guide](slackpipe_collection.md) for timing boundaries, memory
+diagnosis, output schemas and retained independent benchmark runs (`--runs 3`).
 
 Expected artifacts below `--output`:
 
@@ -207,9 +209,9 @@ Expected artifacts below `--output`:
 - `calibration/model_manifest.json`, `calibration_events.json`, `observations.json`,
   `cost_profile.json`, `fit_diagnostics.json`, per-partition layer/result files.
 - `solve/slackpipe.plan.json` and the solver's existing result/orders/CSV files.
-- `benchmark/{baseline,partition,slackpipe}/result.rank*.json`, `benchmark/summary.json`.
-- `trace/{baseline,slackpipe}/rank*_torch.json`, `rank*_trace.json`,
-  SlackPipe runtime order JSON, `trace/timeline.{pdf,png}`, `figure_report.json`.
+- `benchmark/{baseline,partition,slackpipe}/runNNN/result.rank*.json`, `benchmark/summary.json`.
+- `trace/{baseline,slackpipe}/RUN/METHOD/*.cycleCCC.{torch,compact}.json`,
+  per-rank collection metadata/samples, `trace/timeline.{pdf,png}`, `figure_report.json`.
 
 Generated outputs, builds and dependency environments are not committed.
 All local Megatron tests run in `slackpipe-dev`; the stock-image API probe above

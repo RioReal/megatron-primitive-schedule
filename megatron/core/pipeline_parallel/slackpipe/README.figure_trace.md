@@ -1,5 +1,10 @@
 # Paper-style schedule traces
 
+For current commands, collection modes and output schemas, use the
+[reproducible collection guide](../../../../docs/slackpipe_collection.md).
+Historical demo settings/results at the end of this page describe existing
+artifacts, not the new default collection policy.
+
 This is an opt-in **diagnostic capture**, not a benchmark. No normal training
 entry point imports or enables it. Scheduler/solver implementations and tensor
 execution are unchanged. The standalone driver reuses the existing real-model
@@ -19,8 +24,9 @@ generically, but clock alignment is explicitly single-host only.
 
 Baseline uses ordinary interleaved 1F1B with uniform split [3,3,3,3]. SlackPipe
 uses the unchanged LARGE solver plan, split [1,3,5,3], with nccl-rma. All other
-model/data settings are identical. Five normal, unprofiled optimizer steps warm
-the runtime, then zero-based iteration 5 is captured. Initial RMA setup is outside
+model/data settings are identical. The historical demo used five warmups and
+captured iteration 5. New runs default to 20 full optimizer warmups followed by
+three profiler cycles, wait=2/warmup=2/active=3. Initial RMA setup is outside
 the capture. Baseline/SlackPipe are separate fresh distributed runs.
 
 The example plan/model and recorded outputs below are generated artifacts, not
@@ -38,20 +44,20 @@ docker exec -e PYTHONPATH=/workspace/Megatron-LM \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 -e OMP_NUM_THREADS=1 slackpipe-dev \
   /opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
   tools/capture_schedule_trace.py \
-  --slackpipe-profiler-output slackpipe_traces/figure_demo/baseline \
+  --slackpipe-profiler-output slackpipe_traces/new_figure/baseline \
   --slackpipe-profile-kind baseline \
-  --slackpipe-profile-start-step 5 --slackpipe-profile-num-steps 1 \
+  --collection-mode timeline --warmup-iterations 20 \
+  --profiler-wait 2 --profiler-warmup 2 --profiler-active 3 --profiler-repeat 3 \
   --slackpipe-profile-format both \
   --plan slackpipe_experiments/heterogeneous_scale_sweep/LARGE/joint.plan.json \
   --heterogeneous-config slackpipe_experiments/heterogeneous_scale_sweep/LARGE/model.json
 ```
 
 The driver exposes dimension/seed/LR/transport options; defaults above match the
-known stable LARGE case. `--slackpipe-profile-format torch` keeps raw traces and
-validation/capture metadata without writing compact timing files. `compact`
-and `both` write compact timing too; raw traces are always retained for audit.
-CPU and CUDA profiler activities are enabled only during the selected window.
-No calibration mode, stack capture, memory profiling, or benchmark sweep runs.
+known stable LARGE case. The legacy `--slackpipe-profile-format` option is accepted
+but both raw and compact traces are now always retained. Timeline mode enables
+CPU/CUDA activity without shapes, stacks or memory profiling. Memory mode is a
+separate short diagnostic run; benchmark mode never constructs a profiler.
 
 ## Timing definition
 
@@ -59,24 +65,25 @@ No calibration mode, stack capture, memory profiling, or benchmark sweep runs.
   and the complete step. Backward identity comes directly from its retained
   forward output object, not a guessed FIFO counter or textual solver order.
 - The compact exporter associates CUDA kernel/memcpy/memset events with their
-  originating CPU operations using Kineto `External id`, then with the enclosing
-  labeled CPU range. A GPU envelope starts at its **first correlated CUDA
+  originating CPU operations using CUDA launch correlation with Kineto external-ID
+  fallback, then with the enclosing labeled CPU range. Backward includes nested
+  autograd engine-thread nodes. A GPU envelope starts at its **first correlated CUDA
   activity** and ends at its **last correlated CUDA activity**. CPU launch range
   bounds are retained separately. Mirrored `gpu_user_annotation` records are not
   counted as new logical operations.
-- Thus the plot is neither CPU launch latency nor the union/sum of raw kernels.
+- The default context plot is neither CPU launch latency nor the union/sum of raw kernels.
   Each colored envelope may include internal dispatch gaps. White gaps mean no
   plotted envelope is active; unplotted communication/control/finite-check work
   can still execute there. They are not a measurement of hardware idle percentage.
 - Step envelopes use all correlated CUDA activity in the complete training step,
-  including finite checks and SGD. Arrows use `max(step end over ranks) -
+  including SGD; new collection puts finite checks outside measurement. Arrows use `max(step end over ranks) -
   min(step start over ranks)`. The raw time base is retained as integer
   `baseTimeNanoseconds`, with relative `start_us/end_us`. Different rank trace
   bases are converted before subtracting the common panel origin. Ranks are
   **not** independently shifted to their first forward operation.
 - CUDA events independently bracket the full step. Their elapsed times include
   small boundary dispatch gaps outside the first/last GPU activity. The exporter
-  reports this discrepancy and rejects differences above max(2 ms, 5%). The
+  reports this discrepancy and flags differences above max(2 ms, 5%) without dropping samples. The
   panel report also gives an event-duration estimate anchored at each rank's
   first activity; it is an estimate, not a separately synchronized global event
   clock. The plotted duration is exactly the GPU-envelope span by definition.
@@ -86,7 +93,7 @@ No calibration mode, stack capture, memory profiling, or benchmark sweep runs.
 
 ## Compact format and validation
 
-`rankR_trace.json` uses `slackpipe.figure_trace.v1`: `config`, rank/mode/transport,
+Legacy `rankR_trace.json` uses `slackpipe.figure_trace.v1`: `config`, rank/mode/transport,
 clock/base, `records`, and `steps`. Each envelope has iteration, rank, mode,
 transport, kind, stage, microbatch, start/end microseconds, CPU range bounds,
 GPU activity count, and the originating profiler label. Step/optimizer use -1
@@ -94,21 +101,24 @@ for stage/microbatch. Raw traces live in `torch_profiler/rankR_trace.json`.
 `rankR_capture.json` retains settings and independent measurements;
 `rankR_validation.json` records successful checks.
 
-Validation rejects missing/duplicate operations, invalid or overlapping compute
-envelopes, missing CUDA activity/clock metadata, timing-bracket mismatches, and
-SlackPipe order differing from the production plan parser's operations.
+New `RUN.METHOD.rankR.cycleCCC.compact.json` uses `slackpipe.figure_trace.v2`, adds
+flat activities, CPU allocation calls, interval-union/gap metrics, capture IDs and
+actual profiler metadata. Raw files and samples are preserved per cycle/rank.
+Validation rejects missing/duplicate operations, invalid envelopes, overlapping
+CPU dispatch ranges, missing CUDA activity/clock metadata and incorrect plan
+order. GPU envelopes can overlap across streams. Timing mismatches remain warnings.
 
 ## Plot
 
 ```bash
 docker exec -e PYTHONPATH=/workspace/Megatron-LM slackpipe-dev /opt/venv/bin/python \
   tools/plot_schedule_trace.py \
-  --baseline slackpipe_traces/figure_demo/baseline \
-  --slackpipe slackpipe_traces/figure_demo/slackpipe \
-  --output-png slackpipe_traces/figure_demo/figures/schedule_trace.png \
-  --output-pdf slackpipe_traces/figure_demo/figures/schedule_trace.pdf \
-  --report slackpipe_traces/figure_demo/report.json \
-  --iteration 5 --color-mode microbatch --annotate-time-saved
+  --baseline slackpipe_traces/new_figure/baseline \
+  --slackpipe slackpipe_traces/new_figure/slackpipe \
+  --output-png slackpipe_traces/new_figure/figures/schedule_trace.png \
+  --output-pdf slackpipe_traces/new_figure/figures/schedule_trace.pdf \
+  --report slackpipe_traces/new_figure/report.json \
+  --iteration 24 --color-mode microbatch --detail
 ```
 
 `--title` and `--caption` customize figure text; `--color-mode direction` disables
@@ -116,8 +126,15 @@ microbatch shading. Forward is blue, backward orange, optimizer gray. Both panel
 share millisecond units and limits. Negative savings are reported numerically
 in JSON but do not get a misleading positive savings arrow.
 
-Focused tests: inside `slackpipe-dev`, run `python -m pytest
-tests/unit_tests/pipeline_parallel/test_slackpipe_figure_trace.py -q`.
+`--detail` shows GPU, NCCL-named activity and CPU allocation lanes under translucent
+envelopes. Select any captured global iteration; omission chooses the earliest
+common complete-rank iteration, retaining all candidates in the report. Multiple
+runs require explicit run filters. Timestamps are never averaged or rescaled.
+
+Focused tests: inside `slackpipe-dev`, run `/opt/venv/bin/python -m
+torch.distributed.run --standalone --nproc-per-node=1 -m pytest
+tests/unit_tests/pipeline_parallel/test_slackpipe_figure_trace.py
+tests/unit_tests/pipeline_parallel/test_slackpipe_collection.py -q`.
 
 ## Recorded demo
 
