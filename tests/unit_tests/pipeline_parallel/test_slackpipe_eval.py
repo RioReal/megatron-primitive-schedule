@@ -212,18 +212,20 @@ def test_experiment_resume_never_launches_matching_stage(tmp_path, monkeypatch):
         ]
     )
     exp = Experiment(args)
-    monkeypatch.setattr(exp, "_context", lambda stage, parents: dict(key=1))
     monkeypatch.setattr(exp, "_execute", lambda *args: pytest.fail("resume launched a subprocess"))
     receipts = tmp_path / "receipts"
     receipts.mkdir()
+    context = exp._context("env", {})
     receipt = dict(
+        schema_version="slackpipe.eval_receipt.v2",
         status="passed",
         stage="env",
-        context=dict(key=1, run_index=None),
+        context=context,
+        context_hash=fingerprint(context),
         artifacts={"config.json": digest(config)},
     )
     (receipts / "1f1b.env.json").write_text(json.dumps(receipt))
-    assert exp.ensure("env") == receipt
+    assert fingerprint(exp.ensure("env")) == fingerprint(receipt)
     exp.completed.clear()
     config.write_text("changed")
     with pytest.raises(RuntimeError, match="stale"):

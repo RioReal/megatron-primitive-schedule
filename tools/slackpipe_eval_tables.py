@@ -140,7 +140,9 @@ def export_tables(output: Path, config_paths: list) -> None:
             )
             continue
         context = receipt["context"]
-        base.update(schedule=context["schedule"], **context["topology"])
+        base.update(
+            schedule=receipt.get("schedule", path.name.split(".")[0]), **context["topology"]
+        )
         if stage == "benchmark":
             summary = json.loads((root / receipt["summary"]).read_text())
             grouped.setdefault((base["model"], base["schedule"]), []).append((base, summary))

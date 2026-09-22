@@ -105,7 +105,7 @@ def main() -> None:
                     args = copy.copy(base)
                     args.stage, args.schedule = "benchmark", schedule
                     args.logical_stages = args.pp if schedule == "1f1b" else base.logical_stages
-                    args.repetitions, args.run_index = 1, rep
+                    args.run_index = rep
                     args.resume, args.force = (campaign.resume or rep > 0, campaign.force)
                     result = Experiment(args).execute()
                     if result["status"] == "passed":
@@ -117,7 +117,7 @@ def main() -> None:
                 args = copy.copy(base)
                 args.stage, args.schedule = "trace", schedule
                 args.logical_stages = args.pp if schedule == "1f1b" else base.logical_stages
-                args.repetitions, args.run_index, args.resume = 1, len(ordering) - 1, True
+                args.run_index, args.resume = None, True
                 args.force = campaign.force
                 traces[schedule] = Experiment(args).execute()
             plot_campaign(root, traces)

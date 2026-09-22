@@ -143,12 +143,107 @@ emits compatible plan.v1 without a profile hash; a separate
 Hybrid plan.v2 retains embedded profile/manifest hashes. Worker lists always come
 from C++ validated schedule export, never reconstructed from a heuristic.
 
-`slackpipe.eval_receipt.v1` receipts bind source and environment, configuration, collection policy,
-prerequisite receipts and artifact hashes. `--resume` reuses exact matches;
-stale receipts are rejected. `--force` creates new immutable attempts for the
-requested stage and stale prerequisites; matching prerequisites can be reused.
-`full --force` reruns the complete chain. Failed logs and older attempts remain.
-Changing software, model, precision, shape, policy or seed invalidates acceptance.
+### Stage-specific Receipts and Resume
+
+`slackpipe.eval_receipt.v2` uses `context_schema_version: 2` and an explicit
+`context_hash`. Each stage binds model-config hash, topology (PP/N/VPP/B and
+TP/DP/CP), precision, sequence/microbatch shape, transport, source and environment.
+N/B/sequence remain in the environment preflight identity because its capacity
+estimate uses them. Model-config identity also binds the hybrid manifest inputs.
+Additional inputs are stage-specific:
+
+| Stage | Additional inputs and dependencies |
+| --- | --- |
+| env | Hardware/dependency/allocator settings; no iteration policy |
+| correctness | env; pinned small-fixture test selected by PP/precision/transport |
+| native-smoke / smoke | correctness or solve; actual native/requested schedule, seed, learning rate, smoke warmups/iterations |
+| calibrate | native-smoke; native schedule, seed/LR, calibration warmups/iterations, partition-design and existing estimator identity |
+| solve | calibration context and artifact hashes; executable SHA256, algorithm, time limit, seed, worker count and fixed solver options |
+| benchmark | smoke/model/plan; schedule, seed/LR, benchmark warmups/iterations; repetition index or standalone group count |
+| trace | smoke/model/plan; schedule, seed/LR, trace warmups, profiler schedule/options and trace format |
+
+Parent identity includes the parent's context and artifact checksums, not receipt
+migration notes or schedule aliases. Namespace files remain
+`receipts/METHOD.STAGE[.runNNN].json`. Exact compatible native prerequisites may
+share immutable artifact directories across methods, without overwriting another
+method's receipt. Different N/PP or other relevant inputs prevent sharing.
+
+Warmups are now independent: `--warmups` controls benchmark only;
+`--calibration-warmups`, `--smoke-warmups` and `--trace-warmups` default to five.
+`--smoke-iterations` defaults to two; `--calibration-iterations` defaults to ten.
+Set all four warmups explicitly for a common twenty-step stability diagnostic.
+Non-trace workers receive fixed unused profiler defaults, preventing trace flags
+from leaking into benchmark metadata. Training and calibration implementations
+and mathematical definitions are unchanged.
+
+Examples of invalidation under `--resume`:
+
+- Changing campaign `--repetitions` adds missing indexed benchmark runs. It does
+  not redo env, correctness, calibration, solve or existing indexed benchmarks.
+- Changing benchmark `--warmups`/`--iterations` creates new benchmark attempts
+  only, not calibration, solve or independently captured traces.
+- Changing `--calibration-iterations`/`--calibration-warmups` creates calibration,
+  solve and downstream optimized smoke/benchmark/trace attempts. Native baseline
+  benchmarks do not depend on SlackPipe calibration.
+- Changing `--solver-seconds` or executable bytes changes solve and downstream
+  optimized execution only; changing profiler settings changes trace only.
+
+Campaign keeps the requested repetition count unchanged, setting only `run_index`
+for a single fresh-process benchmark. Standalone `--run-index 0` has the same
+semantics; without an index, standalone benchmark retains its grouped repetitions.
+`full` still runs benchmark before trace and stops on failure; trace identity no
+longer depends on benchmark timing policy. Do not mix standalone grouped benchmark
+receipts and campaign indexed benchmarks in one output when aggregating runs.
+
+`--resume` reuses compatible completed stages, executes missing stages, and starts
+new immutable attempts for changed **v2** stage inputs. Corrupt artifacts, unknown
+schemas and unverifiable legacy compatibility stop with a reason. `--force`
+explicitly reruns the requested stage, reusing valid prerequisites; `full --force`
+reruns the chain. Replaced control receipts are archived under `receipts/history/`
+with content hashes; old attempt directories and all raw artifacts remain intact.
+
+### Legacy v1 Compatibility and Inspection
+
+The audited v1 driver put benchmark/calibration/profiler settings into every
+context and campaign changed `repetitions=3` to `1`. v2 can automatically migrate
+compatible v1 upstream receipts during `--resume`, without invoking calibration
+or the solver. It checks every artifact checksum, model/precision/shape/topology,
+actual old warmups/iterations, solver settings/bytes, original full parent receipt
+hashes, production profile validation and plan/profile provenance. The original
+receipt is archived and the migration records original context/receipt hashes and
+source identity. Artifact bytes are never rewritten.
+
+Legacy `policy.warmups` really controlled calibration and smoke too. If the old
+run used `--warmups 20`, supply `--calibration-warmups 20 --smoke-warmups 20` to
+reuse it, regardless of the new benchmark warmups. A relevant mismatch is not
+silently waived. v1 trace's old dependency contract is not migrated; capture a
+new trace with `trace --force` (compatible calibration/solve remain reusable).
+
+Source equality is required, except for the explicitly audited clean v1 checkpoint
+`5f000dcc5da4b5ece14a617456a4eca3acd3bbf7`: a Git content comparison permits only
+this receipt/orchestration/test/doc fix while rejecting changes elsewhere,
+including worker/model/calibration/runtime/solver sources. Unknown or dirty old
+source, changed untracked source, hardware, dependencies or allocator configuration
+cannot be automatically certified. Keep the old source provenance and diagnose
+the mismatch; `--force` is not a substitute for recovering expensive results.
+
+Inspect without launching training, writing receipts, or modifying artifacts:
+
+```bash
+docker exec -w /workspace/Megatron-LM slackpipe-dev /opt/venv/bin/python \
+  -m tools.run_slackpipe_eval inspect \
+  --model-config configs/slackpipe_eval/llama_8b.json --schedule slackpipe \
+  --pp 4 --logical-stages 8 --microbatches 8 --seq-length 1024 --precision bf16 \
+  --output /workspace/slackpipe_real_eval/llama/8b --run-index 0
+```
+
+Use the original transport, solver executable and calibration settings as well.
+The report includes stage, schema, context hash, artifact paths/status and
+compatible/stale reasons. `--run-index` selects a campaign benchmark receipt;
+omit it for a standalone grouped benchmark. `--explain-receipt` prints decisions
+during normal execution. Unit tests exercise legacy migration, input invalidation,
+namespace isolation, and the actual campaign entry point resuming three runs with
+synthetic workers. They do not allocate an 8B model or claim a RunPod hardware pass.
 
 ## Measurement and Traces
 
@@ -241,7 +336,36 @@ receipt reuse. Run Megatron tests only in `slackpipe-dev` as documented in READM
 Full 4B/8B/16B/30B allocation and PP4 runtime remain hardware acceptance tasks, not
 claims inferred from a successful configuration parser or small-model run.
 
-### Local Acceptance Record
+Receipt-only regression coverage is in
+`tests/unit_tests/pipeline_parallel/test_slackpipe_eval_receipts.py` (37 tests).
+It checks the standalone-3/campaign-1 reproduction, selective benchmark,
+calibration, solver and trace invalidation, solver executable changes, immutable
+history, read-only inspection, safe/unsafe legacy migration including the source
+fix boundary, and partial three-repetition campaign resume with real receipt IO
+and summary aggregation. The LLaMA 8B RunPod artifact directory was not present
+on the development machine; its reuse was validated with fixtures, not certified
+against unavailable remote files. No full-size benchmark was rerun for this fix.
+
+For GPU regressions, set the existing deterministic policy **before imports**:
+
+```bash
+docker exec -w /workspace/Megatron-LM \
+  -e OMP_NUM_THREADS=1 -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 \
+  -e MAMBA_DETERMINISTIC=1 -e TRITON_CACHE_AUTOTUNING=0 \
+  -e NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 -e SLACKPIPE_TEST_TRANSPORT=nccl-p2p \
+  slackpipe-dev /opt/venv/bin/python -m torch.distributed.run \
+  --standalone --nproc-per-node 2 -m pytest tests/unit_tests/pipeline_parallel/ \
+  -k slackpipe -q
+```
+
+Use one rank for PP1 or `SLACKPIPE_TEST_TRANSPORT=nccl-rma` for RMA.
+An initial unconstrained PP2 invocation during this fix reproduced the documented
+hybrid FP32 non-bitwise result (maximum gradient difference about 3.05e-6).
+The deterministic PP2 P2P and RMA runs each passed all 172 applicable tests per
+rank, with ten topology skips; numerical tolerances and kernel implementations
+were not changed.
+
+### Initial Framework Acceptance Record
 
 On the two-GPU development container, the added 29 tests pass as part of the
 full SlackPipe regression suite: PP1 **130 passed / 15 configuration skips**;

@@ -280,6 +280,15 @@ Defaults are 5 full-step warmups, 50 measured iterations, 3 repetitions; trace
 capture is a separate run with every profiler cycle preserved. Configuration,
 source, allocator, topology and timing provenance are receipt-gated. Large models
 get a memory preflight, never silent resizing or repeated OOM probing.
+Generic receipts now use stage-specific v2 contexts: benchmark repetitions and
+iteration counts do not invalidate calibration/solve; calibration changes affect
+its downstream optimized runs, solver options affect solve/downstream, and
+profiler options affect trace only. Warmups have separate benchmark, calibration,
+smoke and trace flags. `--resume` safely migrates verifiable v1 receipts without
+rerunning expensive stages and preserves original receipts/artifacts; unknown
+compatibility is rejected. Use `run_slackpipe_eval inspect` for a read-only audit
+or `--explain-receipt` for execution-time decisions. The guide documents migration
+constraints and `--resume`/`--force` semantics.
 See the guide for Docker commands, v1/v2 cost and plan handling, limitations and
 output schemas. Four-GPU/full-size runs still require actual hardware acceptance;
 small two-GPU checks do not certify those results. Existing Nemotron/RunPod

@@ -16,9 +16,26 @@ from tools.slackpipe_eval_config import (
     parameter_breakdown,
     schedule_topology,
 )
+from tools.slackpipe_eval_receipts import (
+    RECEIPT_SCHEMA,
+    archive_receipt,
+    assess_receipt,
+    parent_identity,
+    receipt_valid,
+)
 from tools.slackpipe_hybrid import write_json
 
-STAGES = ("env", "correctness", "smoke", "calibrate", "solve", "benchmark", "trace", "full")
+STAGES = (
+    "env",
+    "correctness",
+    "smoke",
+    "calibrate",
+    "solve",
+    "benchmark",
+    "trace",
+    "full",
+    "inspect",
+)
 
 
 def argument_parser() -> argparse.ArgumentParser:
@@ -42,6 +59,10 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--calibration-iterations", type=int, default=10)
+    parser.add_argument("--calibration-warmups", type=int, default=5)
+    parser.add_argument("--smoke-warmups", type=int, default=5)
+    parser.add_argument("--smoke-iterations", type=int, default=2)
+    parser.add_argument("--trace-warmups", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument(
         "--run-index", type=int, help="Campaign repetition identity; does not change the data seed"
@@ -54,6 +75,7 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--explain-receipt", action="store_true")
     return parser
 
 
@@ -77,6 +99,10 @@ def normalize_args(args):
             args.micro_batch_size,
             args.timeout,
             args.solver_seconds,
+            args.calibration_warmups,
+            args.smoke_warmups,
+            args.smoke_iterations,
+            args.trace_warmups,
         )
         < 1
     ):
@@ -87,21 +113,12 @@ def normalize_args(args):
         or min(args.profiler_active, args.profiler_repeat) < 1
     ):
         raise ValueError("Invalid calibration/profiler schedule")
+    if args.run_index is not None and args.run_index < 0:
+        raise ValueError("run-index must be non-negative")
     args.output, args.model_config, args.solver = (
         p.resolve() for p in (args.output, args.model_config, args.solver)
     )
     return args
-
-
-def receipt_valid(receipt: dict, context: dict, root: Path) -> bool:
-    return (
-        fingerprint(receipt.get("context")) == fingerprint(context)
-        and all(
-            (root / p).is_file() and digest(root / p) == checksum
-            for p, checksum in receipt.get("artifacts", {}).items()
-        )
-        and bool(receipt.get("artifacts"))
-    )
 
 
 def memory_preflight(
@@ -202,10 +219,13 @@ class Experiment:
             f"--nproc-per-node={args.pp}",
         ]
         self.completed = {}
+        self._identity = None
 
-    def _context(self, stage, parents):
+    def _base_context(self):
         from megatron.core.pipeline_parallel.slackpipe.collection import environment_metadata
 
+        if self._identity is not None:
+            return self._identity
         args = self.args
         import torch
 
@@ -216,43 +236,114 @@ class Experiment:
             str(torch.cuda.get_device_properties(i).uuid) for i in range(torch.cuda.device_count())
         ]
         environment["worker_deterministic_environment"] = DETERMINISTIC
-        return dict(
+        self._identity = dict(
             model_config_hash=fingerprint(self.model),
             topology=self.topology,
-            schedule=args.schedule,
             precision=args.precision,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             transport=args.transport,
-            seed=args.seed,
-            learning_rate=args.learning_rate,
-            policy={
-                k: getattr(args, k)
-                for k in (
-                    "warmups",
-                    "iterations",
-                    "calibration_iterations",
-                    "repetitions",
-                    "profiler_wait",
-                    "profiler_warmup",
-                    "profiler_active",
-                    "profiler_repeat",
-                )
-            },
             source=source_identity(),
             environment=environment,
-            parents={k: fingerprint(v) for k, v in parents.items()},
-            solver_sha256=(
-                digest(args.solver) if stage == "solve" and args.solver.is_file() else None
-            ),
-            solver_seconds=args.solver_seconds if stage == "solve" else None,
         )
+        return self._identity
+
+    def _context(self, stage, parents):
+        """Fingerprint actual stage inputs, never a campaign-wide measurement policy."""
+        args = self.args
+        context = dict(self._base_context(), context_schema_version=2, stage=stage)
+        context["parents"] = {k: parent_identity(v) for k, v in parents.items()}
+        if stage not in ("env", "correctness"):
+            context.update(seed=args.seed, learning_rate=args.learning_rate)
+        if stage not in ("env", "correctness", "solve"):
+            context["schedule"] = (
+                ("1f1b" if args.logical_stages == args.pp else "interleaved")
+                if stage in ("native-smoke", "calibrate")
+                else args.schedule
+            )
+        policy = {}
+        if stage in ("smoke", "native-smoke"):
+            policy = dict(warmups=args.smoke_warmups, iterations=args.smoke_iterations)
+        elif stage == "calibrate":
+            policy = dict(
+                warmups=args.calibration_warmups,
+                iterations=args.calibration_iterations,
+                partitions=(
+                    "class-identifiable-v1"
+                    if self.model["model_family"] == "nemotron_h"
+                    else "uniform"
+                ),
+                estimator="existing-stage-wall-time-v1",
+            )
+        elif stage == "solve":
+            context.update(
+                solver_sha256=digest(args.solver) if args.solver.is_file() else None,
+                solver_seconds=args.solver_seconds,
+                solver_algorithm="joint-unrestricted-no-overlap",
+                solver_workers=2,
+                require_optimal=False,
+                ratio=[1, 1],
+            )
+        elif stage == "benchmark":
+            policy = dict(warmups=args.warmups, iterations=args.iterations)
+            context.update(
+                run_index=args.run_index,
+                repetitions=args.repetitions if args.run_index is None else 1,
+            )
+        elif stage == "trace":
+            policy = dict(
+                warmups=args.trace_warmups,
+                **{
+                    k: getattr(args, k)
+                    for k in (
+                        "profiler_wait",
+                        "profiler_warmup",
+                        "profiler_active",
+                        "profiler_repeat",
+                    )
+                },
+                trace_format="slackpipe.figure_trace.v2",
+                profiler="cpu+cuda;no-shapes-stack-memory",
+            )
+        context["policy"] = policy
+        return context
+
+    def dependencies(self, stage):
+        optimized = self.args.schedule in ("slackpipe", "optimized_interleaved")
+        return {
+            "env": (),
+            "correctness": ("env",),
+            "native-smoke": ("correctness",),
+            "calibrate": ("native-smoke",),
+            "solve": ("calibrate",),
+            "smoke": ("solve",) if optimized else ("correctness",),
+            "benchmark": ("smoke",),
+            "trace": ("smoke",),
+        }[stage]
+
+    def receipt_path(self, stage):
+        index = self.args.run_index
+        suffix = f".run{index:03d}" if stage == "benchmark" and index is not None else ""
+        return self.output / "receipts" / f"{self.args.schedule}.{stage}{suffix}.json"
 
     def _execute(self, command, directory, name):
         run(command, directory / f"{name}.log", self.args.timeout, self.env)
 
     def _worker(self, stage, directory, *, schedule=None, plan=None, profile=None, iterations=None):
         args = self.args
+        warmups = {
+            "calibrate": args.calibration_warmups,
+            "smoke": args.smoke_warmups,
+            "trace": args.trace_warmups,
+        }.get(stage, args.warmups)
+        profiler = (
+            (args.profiler_wait, args.profiler_warmup, args.profiler_active, args.profiler_repeat)
+            if stage == "trace"
+            else (2, 2, 3, 3)
+        )
+        measured = (
+            sum(profiler[:3]) * profiler[3] if stage == "trace" else (iterations or args.iterations)
+        )
         command = self.torchrun + [
             "-m",
             "tools.slackpipe_eval_worker",
@@ -280,21 +371,21 @@ class Experiment:
             "--learning-rate",
             args.learning_rate,
             "--warmups",
-            args.warmups,
+            warmups,
             "--iterations",
-            iterations or args.iterations,
+            measured,
             "--output",
             directory,
             "--run-id",
             f"{directory.parent.name}-{directory.name}",
             "--profiler-wait",
-            args.profiler_wait,
+            profiler[0],
             "--profiler-warmup",
-            args.profiler_warmup,
+            profiler[1],
             "--profiler-active",
-            args.profiler_active,
+            profiler[2],
             "--profiler-repeat",
-            args.profiler_repeat,
+            profiler[3],
         ]
         if plan:
             command += ["--plan", plan, "--profile", profile]
@@ -305,49 +396,58 @@ class Experiment:
             return self.completed[stage]
         args = self.args
         optimized = args.schedule in ("slackpipe", "optimized_interleaved")
-        dependencies = {
-            "env": (),
-            "correctness": ("env",),
-            "calibrate": ("native-smoke",),
-            "native-smoke": ("correctness",),
-            "solve": ("calibrate",),
-            "smoke": ("solve",) if optimized else ("correctness",),
-            "benchmark": ("smoke",),
-            "trace": ("benchmark",),
-        }
-        parents = {p: self.ensure(p) for p in dependencies[stage]}
+        parents = {p: self.ensure(p) for p in self.dependencies(stage)}
         if any(p["status"] != "passed" for p in parents.values()):
             result = dict(
-                schema_version="slackpipe.eval_receipt.v1",
+                schema_version=RECEIPT_SCHEMA,
                 status="skipped_prerequisite",
                 stage=stage,
                 parents=parents,
             )
-            write_json(self.output / "receipts" / f"{args.schedule}.{stage}.json", result)
+            path = self.receipt_path(stage)
+            if path.exists():
+                archive_receipt(path, json.loads(path.read_text()))
+            write_json(path, result)
             self.completed[stage] = result
             return result
         context = self._context(stage, parents)
-        suffix = (
-            f".run{args.run_index:03d}"
-            if stage in ("benchmark", "trace") and args.run_index is not None
-            else ""
-        )
-        context["run_index"] = args.run_index if stage in ("benchmark", "trace") else None
-        receipt_path = self.output / "receipts" / f"{args.schedule}.{stage}{suffix}.json"
+        receipt_path = self.receipt_path(stage)
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text())
             reusable = args.resume or (args.force and stage != args.stage and args.stage != "full")
+            state, reason, accepted = assess_receipt(receipt, context, self.output, parents)
+            if args.explain_receipt:
+                print(f"{receipt_path}: {state}: {reason}")
             if (
                 reusable
-                and not (args.force and stage == args.stage)
-                and receipt_valid(receipt, context, self.output)
+                and not (args.force and args.stage in (stage, "full"))
+                and state in ("compatible", "legacy-compatible")
             ):
-                self.completed[stage] = receipt
-                return receipt
-            if not args.force:
+                if state == "legacy-compatible":
+                    archive_receipt(receipt_path, receipt)
+                    write_json(receipt_path, accepted)
+                    print(f"Migrated {receipt_path}: {reason}; artifact bytes unchanged")
+                self.completed[stage] = accepted
+                return accepted
+            if not args.force and not (args.resume and state == "stale"):
                 raise RuntimeError(
-                    f"Existing/stale receipt: {receipt_path}; use --resume for an exact match or --force for a new immutable attempt"
+                    f"Existing/stale receipt: {receipt_path}: {state}: {reason}; "
+                    "use --resume for compatible reuse/new v2 context, or --force for an explicit new attempt"
                 )
+            archive_receipt(receipt_path, receipt)
+        elif args.resume:
+            # Shared native prerequisites keep separate schedule namespaces, but reuse exact bytes.
+            if stage in ("env", "correctness", "native-smoke", "calibrate", "solve"):
+                for candidate in sorted(receipt_path.parent.glob(f"*.{stage}.json")):
+                    receipt = json.loads(candidate.read_text())
+                    state, _, _ = assess_receipt(receipt, context, self.output, parents)
+                    if state == "compatible":
+                        receipt = dict(
+                            receipt, schedule=args.schedule, reused_from=str(candidate.name)
+                        )
+                        write_json(receipt_path, receipt)
+                        self.completed[stage] = receipt
+                        return receipt
         folder = {"calibrate": "calibration", "solve": "solver", "trace": "traces"}.get(
             stage, args.schedule
         )
@@ -358,10 +458,12 @@ class Experiment:
             raise ValueError("Output belongs to a different model; use a different directory")
         write_json(config_path, self.model)
         result = dict(
-            schema_version="slackpipe.eval_receipt.v1",
+            schema_version=RECEIPT_SCHEMA,
             status="passed",
             stage=stage,
             context=context,
+            context_hash=fingerprint(context),
+            schedule=args.schedule,
             directory=str(directory.relative_to(self.output)),
         )
         plan = profile = None
@@ -419,7 +521,11 @@ class Experiment:
                     schedule=native if stage in ("native-smoke", "calibrate") else args.schedule,
                     plan=plan,
                     profile=profile,
-                    iterations=args.calibration_iterations if stage == "calibrate" else 2,
+                    iterations=(
+                        args.calibration_iterations
+                        if stage == "calibrate"
+                        else args.smoke_iterations
+                    ),
                 )
                 if stage == "calibrate":
                     result["profile"] = str(
@@ -502,7 +608,10 @@ class Experiment:
                 result["plan"] = str(plan.relative_to(self.output))
             else:
                 runs = []
-                for rep in range(args.repetitions if stage == "benchmark" else 1):
+                repetitions = (
+                    args.repetitions if stage == "benchmark" and args.run_index is None else 1
+                )
+                for rep in range(repetitions):
                     worker = directory / f"run{rep:03d}"
                     self._worker(stage, worker, plan=plan, profile=profile)
                     runs.append(
@@ -534,7 +643,59 @@ class Experiment:
         return result
 
     def execute(self):
+        if self.args.stage == "inspect":
+            return self.inspect()
+        if self.args.stage == "full":
+            benchmark = self.ensure("benchmark")
+            if benchmark["status"] != "passed":
+                return benchmark
         return self.ensure("trace" if self.args.stage == "full" else self.args.stage)
+
+    def inspect(self):
+        """Read-only recursive compatibility audit, without launching or rewriting stages."""
+        reports, accepted = {}, {}
+
+        def visit(stage):
+            if stage in reports:
+                return
+            for parent in self.dependencies(stage):
+                visit(parent)
+            path = self.receipt_path(stage)
+            row = dict(stage=stage, receipt=str(path), status="missing", compatible=False)
+            reports[stage] = row
+            if not path.exists():
+                row["reason"] = "receipt missing"
+                return
+            receipt = json.loads(path.read_text())
+            row.update(
+                schema=receipt.get("schema_version"),
+                context_hash=fingerprint(receipt.get("context")),
+                artifacts=receipt.get("artifacts"),
+                status=receipt.get("status"),
+            )
+            if any(p not in accepted for p in self.dependencies(stage)):
+                row["reason"] = "incompatible/missing prerequisite"
+                return
+            parents = {p: accepted[p] for p in self.dependencies(stage)}
+            state, reason, candidate = assess_receipt(
+                receipt, self._context(stage, parents), self.output, parents
+            )
+            row.update(
+                compatibility=state,
+                reason=reason,
+                compatible=state in ("compatible", "legacy-compatible"),
+            )
+            if row["compatible"]:
+                accepted[stage] = candidate
+
+        stages = (
+            ("solve", "benchmark", "trace")
+            if self.args.schedule in ("slackpipe", "optimized_interleaved")
+            else ("benchmark", "trace")
+        )
+        for stage in stages:
+            visit(stage)
+        return dict(status="passed", inspection=list(reports.values()), read_only=True)
 
 
 def main() -> None:
