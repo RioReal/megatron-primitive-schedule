@@ -1,0 +1,33 @@
+{
+  "schema_version": "slackpipe.eval_model.v1",
+  "name": "nemotron_h_16b",
+  "model_family": "nemotron_h",
+  "scale_label": "16b",
+  "official_or_scaled": "scaled_research",
+  "architecture_source": "https://huggingface.co/nvidia/Nemotron-H-8B-Base-8K/blob/253e00241ff77421b6d811c971e9cee1b2d824ad/config.json",
+  "scaling_rule": "Repeat the authoritative 52-block sequence and take the first num_layers blocks. Scale hidden/FFN widths to target count; attention heads=H/128, query groups=heads/2. Preserve Mamba state_dim=128, head_dim=64 and groups=8; Mamba heads=H/32.",
+  "num_layers": 80,
+  "hidden_size": 4864,
+  "ffn_hidden_size": 25600,
+  "num_attention_heads": 38,
+  "num_query_groups": 19,
+  "vocab_size": 131072,
+  "max_sequence_length": 8192,
+  "normalization": "RMSNorm",
+  "activation": "squared_relu",
+  "position_embedding": "none",
+  "attention_type": "GQA",
+  "ffn_type": "ReLU2",
+  "expected_parameter_scale": 16000000000,
+  "defaults": {
+    "seq_length": 1024,
+    "micro_batch_size": 1,
+    "global_batch_size": 8,
+    "precision": "bf16"
+  },
+  "hybrid_pattern": "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-",
+  "mamba_state_dim": 128,
+  "mamba_head_dim": 64,
+  "mamba_num_groups": 8,
+  "mamba_num_heads": 152
+}

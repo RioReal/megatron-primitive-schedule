@@ -19,6 +19,8 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.schedules import (
@@ -177,11 +179,29 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
     schedule = "slackpipe" if args.mode == "slackpipe" else "default"
     config.pipeline_schedule = schedule
     config.deallocate_pipeline_outputs = schedule == "default"
-    pattern = partition_hybrid_pattern(config.slackpipe_hybrid_pattern, plan)
+    pattern = (
+        partition_hybrid_pattern(config.slackpipe_hybrid_pattern, plan)
+        if getattr(config, "slackpipe_hybrid_pattern", None)
+        else None
+    )
+    vpp = getattr(args, "vpp", args.stages // args.pp)
 
     def provider(
         pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
     ):
+        if pattern is None:
+            return GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=args.vocab_size,
+                max_sequence_length=args.seq_length,
+                pre_process=pre_process,
+                post_process=post_process,
+                vp_stage=vp_stage,
+                pg_collection=pg_collection,
+                position_embedding_type="rope",
+                share_embeddings_and_output_weights=False,
+            )
         return HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -200,13 +220,23 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
         config,
         pipeline_schedule=schedule,
         pp_size=args.pp,
-        vpp=args.stages // args.pp,
+        vpp=vpp,
+        layout=getattr(args, "layout", None),
         provider=provider,
     )
     records = validate_chunk_layers(plan, model, rank)
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / f"layers.rank{rank}.json", records)
     params = _logical_named_parameters(model)
+    if hasattr(args, "exact_parameter_count"):
+        actual = torch.tensor(
+            sum(p.numel() for p in params.values()), device="cuda", dtype=torch.int64
+        )
+        dist.all_reduce(actual)
+        if actual.item() != args.exact_parameter_count:
+            raise ValueError(
+                f"Actual parameter count {actual.item()} != specification {args.exact_parameter_count}"
+            )
     initialize_parameters(params, args.seed, config.num_layers)
     optimizer = torch.optim.SGD(params.values(), lr=args.learning_rate)
     batches = _make_batches(args)
@@ -219,8 +249,10 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
             slackpipe_enable_nvtx=collect in ("trace", "timeline", "memory"),
         )
         if schedule == "slackpipe"
-        else get_forward_backward_func(pp_size=args.pp, vp_size=args.stages // args.pp)
+        else get_forward_backward_func(pp_size=args.pp, vp_size=vpp)
     )
+
+    smoke_updates = []
 
     def iteration():
         optimizer.zero_grad(set_to_none=True)
@@ -230,20 +262,43 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
             model=model,
             num_microbatches=args.num_microbatches,
             seq_length=args.seq_length,
-            micro_batch_size=1,
+            micro_batch_size=args.micro_batch_size,
             forward_only=False,
         )
+        probes = []
+        if getattr(args, "verify_update", False):
+            for p in params.values():
+                if p.grad is not None:
+                    index = p.grad.detach().abs().reshape(-1).argmax()
+                    probes.append((p, index, p.detach().reshape(-1)[index].clone()))
         optimizer.step()
+        if probes:
+            smoke_updates.append(
+                torch.stack([p.detach().reshape(-1)[i] != before for p, i, before in probes]).any()
+            )
         return losses
 
     def assert_finite(losses):
         flags = [torch.isfinite(p).all() for p in params.values()]
         flags += [torch.isfinite(p.grad).all() for p in params.values() if p.grad is not None]
         flags += [torch.isfinite(l["loss"]).all() for l in losses]
+        if hasattr(args, "eval_metadata"):
+            expected_losses = args.num_microbatches if rank == (args.stages - 1) % args.pp else 0
+            flags.append(torch.tensor(len(losses) == expected_losses, device="cuda"))
+            flags.append(
+                torch.tensor(all(p.grad is not None for p in params.values()), device="cuda")
+            )
         finite = torch.stack(flags).all().to(torch.int32)
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         if not finite.item():
             raise RuntimeError("Non-finite loss/gradient/parameter")
+        if getattr(args, "verify_update", False):
+            changed = torch.stack(smoke_updates).any().to(torch.int32)
+            dist.all_reduce(changed, op=dist.ReduceOp.MIN)
+            if not changed.item():
+                raise RuntimeError(
+                    "Smoke requires a representable SGD parameter update on every rank"
+                )
 
     events, measured = [], {}
     if collect == "calibrate":
@@ -284,7 +339,7 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
             hidden_size=config.hidden_size,
             heads=config.num_attention_heads,
             seq_length=args.seq_length,
-            micro_batch_size=1,
+            micro_batch_size=args.micro_batch_size,
             vocab_size=args.vocab_size,
             seed=args.seed,
             learning_rate=args.learning_rate,
@@ -303,6 +358,7 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
                 else None
             ),
         )
+        metadata.update(getattr(args, "eval_metadata", {}))
         measured = collect_steps(
             step=lambda i: iteration(),
             optimizer=optimizer,
@@ -318,7 +374,7 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
                 history_entries=args.memory_history_entries,
             ),
             output=output,
-            method=args.mode,
+            method=getattr(args, "schedule", args.mode),
             transport=args.transport if schedule == "slackpipe" else "megatron-p2p",
             config=metadata,
             plan=plan if schedule == "slackpipe" else None,
@@ -326,6 +382,10 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
         )
         measured["iteration_ms"] = [s["cuda_elapsed_ms"] for s in measured["samples"]]
         measured["wall_ms"] = measured["continuous_wall_ms"]
+    if getattr(args, "verify_update", False):
+        measured["smoke_checks"] = dict(
+            finite_loss_gradients_parameters=True, optimizer_update=True
+        )
     write_json(output / f"result.rank{rank}.json", measured)
     gathered = [None] * args.pp
     dist.all_gather_object(gathered, events)

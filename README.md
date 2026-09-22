@@ -256,6 +256,35 @@ export. The RMA tests require the compatible stack described above. Additional
 reuse/teardown stress is available in `slackpipe_rma_lifecycle_stress.py` with
 `--cycles`, `--reuse`, and `--managed-groups` options.
 
+### Multi-model Real-system Evaluation
+
+The [generic evaluation framework](docs/slackpipe_real_system_eval.md) runs the
+same training/collection implementation for LLaMA-style homogeneous and
+Nemotron-H-style hybrid research configurations at 4B, 8B, 16B and approximately
+30B. Eight versioned specifications are in `configs/slackpipe_eval/`; exact
+parameter counts are reported and checked against constructed models. Only
+Nemotron-H 8B preserves the official Base-8K architecture; other sizes and all
+LLaMA-style presets are explicitly research configurations, not released weights.
+
+Select `--schedule 1f1b`, `interleaved`, or `slackpipe` with
+`python -m tools.run_slackpipe_eval full --model-config CONFIG --output OUTPUT`.
+Native 1F1B uses PP4/N4/VPP=None, while interleaved and SlackPipe default to
+PP4/N8/VPP2. Thus 1F1B versus SlackPipe is a system-level comparison; interleaved
+versus SlackPipe is the better-controlled schedule comparison. Optional
+`optimized_interleaved` isolates partition effects.
+
+`tools/run_slackpipe_real_system_campaign.py` runs/resumes a family/size/schedule
+matrix, independently calibrates each model, rotates fresh-process repetitions,
+and exports raw samples, summary/LaTeX tables and three-panel trace figures.
+Defaults are 5 full-step warmups, 50 measured iterations, 3 repetitions; trace
+capture is a separate run with every profiler cycle preserved. Configuration,
+source, allocator, topology and timing provenance are receipt-gated. Large models
+get a memory preflight, never silent resizing or repeated OOM probing.
+See the guide for Docker commands, v1/v2 cost and plan handling, limitations and
+output schemas. Four-GPU/full-size runs still require actual hardware acceptance;
+small two-GPU checks do not certify those results. Existing Nemotron/RunPod
+commands below remain supported.
+
 ### Nemotron-H 8B / PP=4 validation
 
 The next hardware target is **A100 SXM x4, PP=4, N=8, B=8**, FP32,

@@ -43,6 +43,7 @@ docs/apidocs
 /slackpipe_profiles/
 /slackpipe_experiments*/
 /slackpipe_traces/
+/slackpipe_eval/
 .pytest_cache/
 *.nsys-rep
 *.ncu-rep

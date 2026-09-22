@@ -164,6 +164,7 @@ def render(
     color_mode: str,
     annotate_saved: bool,
     detail: bool = False,
+    noninterleaved: dict | None = None,
 ) -> dict:
     import matplotlib
 
@@ -194,7 +195,7 @@ def render(
     )
     if any(baseline["config"][key] != slackpipe["config"][key] for key in fields):
         raise ValueError("Panels do not use matching model/data settings")
-    if baseline["mode"] != "baseline" or slackpipe["mode"] != "slackpipe":
+    if baseline["mode"] not in ("baseline", "interleaved") or slackpipe["mode"] != "slackpipe":
         raise ValueError("Expected baseline on top and SlackPipe on bottom")
     if baseline["iteration"] != slackpipe["iteration"]:
         raise ValueError("Panels must show the same global iteration")
@@ -207,15 +208,42 @@ def render(
         for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
             if a["environment"][k] != b["environment"][k]:
                 raise ValueError(f"Panels use different {k}")
+    panels = [baseline, slackpipe]
+    titles = ["Interleaved 1F1B", "SlackPipe"]
+    if noninterleaved is not None:
+        if noninterleaved["mode"] != "1f1b" or noninterleaved["iteration"] != baseline["iteration"]:
+            raise ValueError("Expected native 1F1B at the same global iteration")
+        if any(
+            noninterleaved["config"][k] != baseline["config"][k]
+            for k in fields
+            if k != "num_stages"
+        ):
+            raise ValueError("1F1B model/data settings differ")
+        if noninterleaved["config"]["num_stages"] != noninterleaved["config"]["pp"]:
+            raise ValueError("Native 1F1B must have N=PP")
+        for k in ("profiler", "active_iterations", "cycle"):
+            if noninterleaved["collection"][k] != baseline["collection"][k]:
+                raise ValueError(f"1F1B capture policy differs: {k}")
+        for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
+            if (
+                noninterleaved["collection"]["environment"][k]
+                != baseline["collection"]["environment"][k]
+            ):
+                raise ValueError(f"1F1B environment differs: {k}")
+        panels.insert(0, noninterleaved)
+        titles.insert(0, "Native 1F1B")
     plt.rcParams.update(
         {"font.family": "DejaVu Sans", "font.size": 10, "pdf.fonttype": 42, "ps.fonttype": 42}
     )
     fig, axes = plt.subplots(
-        2, 1, figsize=(11, 5.0 + 0.45 * (baseline["rank_count"] - 2)), sharex=True
+        len(panels),
+        1,
+        figsize=(11, 2.5 * len(panels) + 0.45 * (baseline["rank_count"] - 2)),
+        sharex=True,
     )
-    left_bound, right_bound = plot_time_bounds([baseline, slackpipe], detail)
+    left_bound, right_bound = plot_time_bounds(panels, detail)
     padding = max(0.001, (right_bound - left_bound) * 0.025)
-    for panel_index, (axis, panel) in enumerate(zip(axes, (baseline, slackpipe))):
+    for panel_index, (axis, panel) in enumerate(zip(axes, panels)):
         n = panel["rank_count"]
         for record in panel["records"]:
             kind = record["kind"]
@@ -275,11 +303,7 @@ def render(
             fontsize=10,
         )
         axis.set_title(
-            (
-                "(a) Profiled trace of interleaved 1F1B."
-                if panel_index == 0
-                else "(b) Profiled trace of SlackPipe."
-            ),
+            f"({chr(97 + panel_index)}) {titles[panel_index]}: PP={panel['config']['pp']}, N={panel['config']['num_stages']}",
             loc="left",
             fontsize=11,
             pad=9,
@@ -288,13 +312,13 @@ def render(
     if annotate_saved and saved > 0:
         left, right = slackpipe["duration_ms"], baseline["duration_ms"]
         y = slackpipe["rank_count"] - 0.5
-        axes[1].annotate(
+        axes[-1].annotate(
             "",
             xy=(left, y),
             xytext=(right, y),
             arrowprops=dict(arrowstyle="<->", color="#b62732", linewidth=1.2),
         )
-        axes[1].text(
+        axes[-1].text(
             right,
             y + 0.1,
             f"{saved:.2f} ms saved",
@@ -303,7 +327,7 @@ def render(
             va="bottom",
             fontsize=9,
         )
-    axes[1].set_xlabel("Time from panel step start (ms)")
+    axes[-1].set_xlabel("Time from panel step start (ms)")
     fig.suptitle(title, fontsize=12, y=0.98)
     fig.legend(
         handles=(
@@ -333,6 +357,7 @@ def render(
     return dict(
         schema_version="slackpipe.figure_report.v1",
         baseline=baseline,
+        noninterleaved=noninterleaved,
         slackpipe=slackpipe,
         time_saved_ms=saved,
         plot_time_bounds_ms=[left_bound, right_bound],
@@ -349,6 +374,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--slackpipe", type=Path, required=True)
+    parser.add_argument("--noninterleaved", type=Path, help="Optional native 1F1B third panel")
     parser.add_argument("--output-png", type=Path, required=True)
     parser.add_argument("--output-pdf", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
@@ -369,6 +395,10 @@ def main():
         available_iterations(args.baseline, args.baseline_run_id, args.cycle)
         & available_iterations(args.slackpipe, args.slackpipe_run_id, args.cycle)
     )
+    if args.noninterleaved:
+        candidates = sorted(
+            set(candidates) & available_iterations(args.noninterleaved, cycle=args.cycle)
+        )
     if not candidates:
         parser.error("No common complete-rank global iteration")
     iteration = args.iteration if args.iteration is not None else candidates[0]
@@ -382,6 +412,11 @@ def main():
         color_mode=args.color_mode,
         annotate_saved=args.annotate_time_saved,
         detail=args.detail,
+        noninterleaved=(
+            load_panel(args.noninterleaved, iteration, cycle=args.cycle)
+            if args.noninterleaved
+            else None
+        ),
     )
     report["selection"] = dict(
         iteration=iteration,

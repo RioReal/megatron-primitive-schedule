@@ -1,0 +1,28 @@
+{
+  "schema_version": "slackpipe.eval_model.v1",
+  "name": "llama_16b",
+  "model_family": "llama",
+  "scale_label": "16b",
+  "official_or_scaled": "scaled_research",
+  "architecture_source": "megatron/core/models/gpt/gpt_layer_specs.py:get_gpt_layer_with_transformer_engine_spec",
+  "scaling_rule": "Research depth/width scaling with GQA, RMSNorm, SwiGLU, RoPE and untied 131072-token embeddings; not an official LLaMA checkpoint.",
+  "num_layers": 44,
+  "hidden_size": 5120,
+  "ffn_hidden_size": 17920,
+  "num_attention_heads": 40,
+  "num_query_groups": 8,
+  "vocab_size": 131072,
+  "max_sequence_length": 8192,
+  "normalization": "RMSNorm",
+  "activation": "silu",
+  "position_embedding": "rope",
+  "attention_type": "GQA",
+  "ffn_type": "SwiGLU",
+  "expected_parameter_scale": 16000000000,
+  "defaults": {
+    "seq_length": 1024,
+    "micro_batch_size": 1,
+    "global_batch_size": 8,
+    "precision": "bf16"
+  }
+}
