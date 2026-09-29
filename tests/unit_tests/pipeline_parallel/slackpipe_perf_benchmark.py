@@ -43,10 +43,7 @@ from megatron.core.pipeline_parallel.slackpipe.collection import (
     profiler_settings,
     summarize_rank_samples,
 )
-from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
-    build_cost_profile,
-    write_cost_profile,
-)
+from megatron.core.pipeline_parallel.slackpipe.cost_profile import build_cost_profile
 from megatron.core.pipeline_parallel.slackpipe.plan import (
     derive_pipeline_model_parallel_layout,
     load_slackpipe_plan,
@@ -412,6 +409,12 @@ def _benchmark_mode(args, mode, rank):
 
 
 def _calibrate_cost_profile(args, plan, rank):
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+        publish_profile,
+        tag_calibration_events,
+        thresholds_from_args,
+    )
+
     mode = {
         "name": "cost_calibration_solver_split_interleaved_1f1b",
         "schedule": "default",
@@ -455,6 +458,39 @@ def _calibrate_cost_profile(args, plan, rank):
             events.extend(end_slackpipe_cost_calibration_iteration())
     _assert_finite(losses, _logical_params(model))
 
+    tag_calibration_events(
+        events,
+        group="partition0",
+        ranges=plan.stage_layer_ranges,
+        worker=rank,
+        attempt=args.profiling_attempt,
+        raw_path=args.output_dir / "calibration_events.json",
+        configuration=dict(
+            model=dict(
+                num_layers=args.num_layers,
+                heterogeneous_config=(
+                    json.loads(args.heterogeneous_config.read_text())
+                    if args.heterogeneous_config
+                    else None
+                ),
+                hidden_size=args.hidden_size,
+                heads=args.num_attention_heads,
+                seq_length=args.seq_length,
+                vocab_size=args.vocab_size,
+                micro_batch_size=args.micro_batch_size,
+                microbatches=args.num_microbatches,
+            ),
+            seed=args.seed,
+            learning_rate=args.learning_rate,
+            warmups=args.calibration_warmup_iterations,
+            iterations=args.calibration_iterations,
+            precision="fp32",
+            pp=2,
+            vpp=2,
+            environment=provenance["environment"],
+            timing="synchronized-stage-wall-time-v1",
+        ),
+    )
     gathered = [None for _ in range(dist.get_world_size())]
     dist.all_gather_object(gathered, events)
     provenance["memory_end"] = memory_sample()
@@ -462,6 +498,10 @@ def _calibrate_cost_profile(args, plan, rank):
     dist.all_gather_object(all_provenance, provenance)
     if rank == 0:
         all_events = [event for rank_events in gathered for event in rank_events]
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "calibration_events.json").write_text(
+            json.dumps(all_events, indent=2, sort_keys=True), encoding="utf-8"
+        )
         profile = build_cost_profile(
             events=all_events,
             model_config={
@@ -483,10 +523,14 @@ def _calibrate_cost_profile(args, plan, rank):
             percentile_value=args.shared_slope_percentile,
         )
         profile["collection"] = dict(provenance, rank_metadata=all_provenance)
-        write_cost_profile(args.emit_cost_profile, profile)
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        (args.output_dir / "calibration_events.json").write_text(
-            json.dumps(all_events, indent=2, sort_keys=True), encoding="utf-8"
+        (args.output_dir / "observations.json").write_text(
+            json.dumps(profile["observed_stages"], indent=2)
+        )
+        publish_profile(
+            args.emit_cost_profile,
+            profile,
+            thresholds=thresholds_from_args(args),
+            attempt=args.profiling_attempt,
         )
     del batches
     del optimizer
@@ -495,6 +539,8 @@ def _calibrate_cost_profile(args, plan, rank):
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
     dist.barrier()
+    if rank == 0 and not args.emit_cost_profile.is_file():
+        raise SystemExit(2)
 
 
 def _write_summary(args, all_results, plan):
@@ -591,7 +637,10 @@ def _write_summary(args, all_results, plan):
 
 
 def main():
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import add_quality_arguments
+
     parser = argparse.ArgumentParser()
+    add_quality_arguments(parser)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--heterogeneous-config", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)

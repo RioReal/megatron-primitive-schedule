@@ -1118,7 +1118,12 @@ JointOptimizationResult OptimizeJointSplitAndScheduleCpSat(
           : &options.partition_restriction->reference_split;
   const WorkerBalanceConstraintResult worker_balance_constraint =
       ComputeJointWorkerBalanceConstraint(instance, options);
+  Index workload_constraint_count = 0;
   auto populate_mechanism_provenance = [&](JointOptimizationResult* result) {
+    result->raw_bound_globally_valid = !worker_balance_constraint.enabled &&
+        (!options.partition_restriction ||
+         options.partition_restriction->mode == SlackPipeSplitMode::kGlobal);
+    result->workload_constraint_count = workload_constraint_count;
     result->worker_balance_pruning_requested = worker_balance_pruning_requested;
     result->worker_balance_pruning_effective =
         worker_balance_constraint.enabled;
@@ -1713,19 +1718,21 @@ JointOptimizationResult OptimizeJointSplitAndScheduleCpSat(
     builder.AddGreaterOrEqual(makespan,
                               CheckedMul(instance.total_layers, ratio_sum,
                                          "joint critical-chain lower bound"));
-    for (Index w = 0; w < instance.workers; ++w) {
-      LinearExpr worker_layers;
-      for (Index s = 0; s < instance.stages; ++s) {
-        if (s % instance.workers == w) {
-          worker_layers += layers[static_cast<std::size_t>(s)];
-        }
-      }
-      builder.AddGreaterOrEqual(makespan,
-                                CheckedMul(instance.microbatches, ratio_sum,
-                                           "joint worker-load lower bound") *
-                                    worker_layers);
-    }
   }
+  // Each duration variable already represents one F/B operation of one
+  // microbatch. These redundant capacity bounds also cover variable profiles.
+  std::vector<LinearExpr> worker_work(instance.workers);
+  for (Index id = 0; id < op_count; ++id) {
+    worker_work[DecodeOperation(instance, OperationId{id}).worker] += durations[id];
+  }
+  for (Index w = 0; w < instance.workers; ++w) {
+    builder.AddGreaterOrEqual(makespan, worker_work[w])
+        .WithName("worker_workload_bound_" + std::to_string(w));
+    ++workload_constraint_count;
+  }
+  builder.AddGreaterOrEqual(instance.workers * LinearExpr(makespan), LinearExpr::Sum(durations))
+      .WithName("global_workload_capacity_bound");
+  ++workload_constraint_count;
   activation_metadata = AddActivationCapacityConstraints(
       builder, instance, options.activation_options, starts, ends, &layers,
       activation_fixed_split, horizon, activation_partition_optimized);

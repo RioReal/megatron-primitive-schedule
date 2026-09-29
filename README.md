@@ -30,6 +30,12 @@ ordinary Megatron calibration -> cost profile -> ./slackpipe C++ CP-SAT optimize
 
 ### Current functionality
 
+**Artifact status:** software correctness checks are not a reproduction of the
+paper's performance results. See the [artifact audit](docs/slackpipe_artifact_audit.md)
+for the scoped software publication, evidence limitations, and runnable minimal/full
+reproduction instructions. Historical CAL simulation and Nemotron predictions
+must not be presented as current GPU measurements.
+
 - Runtime-validated physical PP=1 and PP=2, logical/VPP stages, cyclic stage-to-worker placement,
   nonuniform partitions, and solver-defined worker-local F/B operation orders.
 - Plan parsing validates coverage, FIFO ordering, worker ownership, and the
@@ -174,11 +180,19 @@ For a small heterogeneous calibration, run from the repository root:
 
 ```bash
 docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. slackpipe-dev \
+  /opt/venv/bin/python -m tools.slackpipe_profile_quality \
+  --collect-output slackpipe_profiles/heterogeneous -- \
   /opt/venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
   tools/slackpipe_heterogeneous_experiment.py \
   --output-dir slackpipe_profiles/heterogeneous \
-  --warmup-iterations 5 --iterations 10
+  --warmup-iterations 20 --iterations 10
 ```
+
+The [profiling quality gate](docs/slackpipe_profile_quality.md) checks group CV,
+comparable cross-group shifts and fit residuals. It retains both attempts and
+repeats the complete collection once in fresh processes; a second failure stops
+automatic solver use. Legacy profiles without quality provenance are not newly
+validated merely because the runtime can parse them.
 
 Use the OR-enabled environment to export an evaluator-validated plan. The mounted
 checkout path is kept identical so the plan's cost-profile reference is also

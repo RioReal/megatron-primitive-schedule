@@ -40,7 +40,6 @@ from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
     build_heterogeneous_cost_profile,
     profile_fingerprint,
     stage_role,
-    write_cost_profile,
 )
 from megatron.core.pipeline_parallel.slackpipe.hybrid import (
     NEMOTRON_H_8B_MAX_SEQUENCE_LENGTH,
@@ -386,6 +385,34 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
         measured["smoke_checks"] = dict(
             finite_loss_gradients_parameters=True, optimizer_update=True
         )
+    if collect == "calibrate":
+        from megatron.core.pipeline_parallel.slackpipe.profile_quality import tag_calibration_events
+
+        tag_calibration_events(
+            events,
+            group=output.name,
+            ranges=plan.stage_layer_ranges,
+            worker=rank,
+            attempt=getattr(args, "profiling_attempt", 0),
+            raw_path=output / f"calibration_events.rank{rank}.json",
+            configuration=dict(
+                manifest=manifest["manifest_hash"],
+                pp=args.pp,
+                stages=args.stages,
+                microbatches=args.num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                precision=args.precision,
+                warmups=args.warmups,
+                iterations=args.iterations,
+                seed=args.seed,
+                learning_rate=args.learning_rate,
+                environment=measured["environment"],
+                timing="synchronized-stage-wall-time-v1",
+                schedule="native",
+            ),
+        )
+        write_json(output / f"calibration_events.rank{rank}.json", events)
     write_json(output / f"result.rank{rank}.json", measured)
     gathered = [None] * args.pp
     dist.all_gather_object(gathered, events)
@@ -400,7 +427,14 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
 
 
 def main() -> None:
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+        add_quality_arguments,
+        publish_profile,
+        thresholds_from_args,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
+    add_quality_arguments(parser)
     parser.add_argument("action", choices=("calibrate", "benchmark", "trace", "timeline", "memory"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -507,6 +541,7 @@ def main() -> None:
                 observed.extend(rows)
                 write_json(args.output / "calibration_events.json", raw)
         if args.action == "calibrate" and rank == 0:
+            write_json(args.output / "observations.json", observed)
             profile = build_heterogeneous_cost_profile(
                 model_manifest=manifest,
                 observed_stage_rows=observed,
@@ -527,8 +562,12 @@ def main() -> None:
                 ],
             )
             profile["cost_profile_hash"] = profile_fingerprint(profile)
-            write_cost_profile(args.output / "cost_profile.json", profile)
-            write_json(args.output / "observations.json", observed)
+            publish_profile(
+                args.output / "cost_profile.json",
+                profile,
+                thresholds=thresholds_from_args(args),
+                attempt=args.profiling_attempt,
+            )
             write_json(
                 args.output / "fit_diagnostics.json",
                 dict(
@@ -549,6 +588,12 @@ def main() -> None:
         shutdown_slackpipe_runtime()
         parallel_state.destroy_model_parallel()
         dist.destroy_process_group()
+        if (
+            args.action == "calibrate"
+            and rank == 0
+            and not (args.output / "cost_profile.json").is_file()
+        ):
+            raise SystemExit(2)
 
 
 if __name__ == "__main__":

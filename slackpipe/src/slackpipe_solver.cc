@@ -5,6 +5,7 @@
 #include <sstream>
 
 #include "slackpipe/breadth_first.h"
+#include "slackpipe/workload_bound.h"
 
 namespace slackpipe {
 
@@ -45,6 +46,13 @@ SlackPipeSplitMode ParseSlackPipeSplitMode(const std::string& text) {
 
 Tick AnalyticalGlobalLowerBound(const Instance& instance) {
   instance.Validate();
+  if (instance.HasCostProfile()) {
+    const auto work = ComputeWorkloadLowerBound(instance);
+    if (!work.total_work_ticks || !work.makespan_ticks) return 0;
+    // One microbatch's complete chain is also a lower bound. Do not use the
+    // abstract F/B ratio for measured profiles, even in this legacy field.
+    return std::max(*work.makespan_ticks, *work.total_work_ticks / instance.microbatches);
+  }
   const Tick ratio_sum =
       CheckedAdd(instance.backward_ratio_num, instance.backward_ratio_den,
                  "SlackPipe analytical lower bound ratio");

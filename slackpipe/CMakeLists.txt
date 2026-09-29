@@ -57,6 +57,7 @@ add_library(slackpipe_core
   src/joint_solver.cc
   src/one_f_one_b.cc
   src/operation.cc
+  src/workload_bound.cc
   src/plan_export.cc
   src/pressure_pruning.cc
   src/result_schema.cc
@@ -187,6 +188,7 @@ if(SLACKPIPE_BUILD_TESTS)
   add_executable(slackpipe_core_tests
     tests/benchmark_tests.cc
     tests/core_tests.cc
+    tests/workload_bound_tests.cc
   )
   if(GTest_FOUND)
     target_link_libraries(slackpipe_core_tests PRIVATE slackpipe_core GTest::gtest_main)

@@ -4857,6 +4857,47 @@ TEST(OrToolsActivationCap, SequentialAndAlternatingRecordCapConstrainedPhases) {
   EXPECT_TRUE(*alternating_analysis.activation_cap_satisfied);
 }
 
+TEST(OrToolsAlternating, StrictAcceptanceAndCompleteRoundStopping) {
+  if (!slackpipe::IsJointOptimizerAvailable()) return;
+  slackpipe::Instance instance;
+  // With one microbatch, every partition has the same serial chain cost.
+  // Enumeration proposes [1,3], lexicographically smaller than uniform [2,2].
+  instance.microbatches = 1;
+  instance.stages = 2;
+  instance.workers = 2;
+  instance.total_layers = 4;
+  slackpipe::AlternatingOptimizerOptions options;
+  options.time_limit_seconds = 10;
+  options.max_rounds = 4;
+  options.fixed_order_partition_backend = "enumerate";
+  const auto result = slackpipe::OptimizeAlternatingPartitionSchedule(instance, options);
+  ASSERT_TRUE(result.schedule.ok());
+  EXPECT_FALSE(result.proven_optimal);
+  EXPECT_EQ(result.alternating_convergence_reason, std::string("no_improvement_round"));
+  ASSERT_TRUE(result.alternating_trace.size() >= 2);
+  EXPECT_TRUE(result.alternating_trace.front().selected_partition ==
+              (std::vector<slackpipe::Tick>{1, 3}));
+  EXPECT_TRUE(result.split == (std::vector<slackpipe::Tick>{2, 2}));
+  bool observed_tie = false;
+  for (const auto& entry : result.alternating_trace) {
+    if (entry.accepted && entry.input_makespan) {
+      ASSERT_TRUE(entry.candidate_makespan.has_value());
+      EXPECT_TRUE(*entry.candidate_makespan < *entry.input_makespan);
+    }
+    if (entry.candidate_makespan == entry.input_makespan) {
+      EXPECT_FALSE(entry.accepted);
+      observed_tie = true;
+    }
+  }
+  EXPECT_TRUE(observed_tie);
+  EXPECT_FALSE(result.alternating_trace.back().accepted);
+  EXPECT_FALSE(result.alternating_trace[result.alternating_trace.size() - 2].accepted);
+  slackpipe::CanonicalResultMetadata metadata;
+  slackpipe::ApplyAlternatingCanonicalFields(result, metadata);
+  EXPECT_EQ(*metadata.alternating_stop_rule,
+            std::string("first_complete_round_without_strict_improvement"));
+}
+
 TEST(OrToolsActivationCap,
      SequentialAndAlternatingReplayProductionFallbackDeterministically) {
   if (!slackpipe::IsJointOptimizerAvailable() ||

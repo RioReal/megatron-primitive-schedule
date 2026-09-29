@@ -47,6 +47,7 @@ struct JointOptimizationResult {
   Tick makespan_ticks = 0;
   double solver_objective_ticks = 0.0;
   double best_bound_ticks = 0.0;
+  Index workload_constraint_count = 0;  // W worker bounds + one capacity bound when built.
   std::string status;
   bool proven_optimal = false;
   double wall_time_seconds = 0.0;
@@ -96,6 +97,7 @@ struct JointOptimizationResult {
   Index auxiliary_variable_count = 0;
   bool worker_balance_pruning_requested = false;
   bool worker_balance_pruning_effective = false;
+  bool raw_bound_globally_valid = true;
   std::optional<double> worker_balance_tolerance_requested_percent;
   std::optional<Index> worker_balance_tolerance_requested_layers;
   std::string incumbent_method_requested_normalized = "slack";

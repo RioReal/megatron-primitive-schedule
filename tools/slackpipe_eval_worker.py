@@ -17,7 +17,6 @@ from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
     build_heterogeneous_cost_profile,
     profile_fingerprint,
     stage_role,
-    write_cost_profile,
 )
 from megatron.core.pipeline_parallel.slackpipe.manifest import (
     build_model_manifest,
@@ -26,6 +25,11 @@ from megatron.core.pipeline_parallel.slackpipe.manifest import (
 from megatron.core.pipeline_parallel.slackpipe.plan import (
     derive_pipeline_model_parallel_layout,
     load_slackpipe_plan,
+)
+from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+    publish_profile,
+    require_profile_quality,
+    thresholds_from_args,
 )
 from megatron.core.pipeline_parallel.slackpipe.schedule import shutdown_slackpipe_runtime
 from tools.slackpipe_eval_config import (
@@ -75,6 +79,7 @@ def validate_profile(
     seq_length: int,
     micro_batch_size: int,
 ) -> None:
+    require_profile_quality(profile)
     expected = dict(
         model_config_hash=fingerprint(model),
         dtype=precision,
@@ -192,6 +197,8 @@ def run_worker(args) -> None:
     if rank == 0:
         write_json(args.output / "model_manifest.json", manifest)
         if args.action == "calibrate":
+            write_json(args.output / "observations.json", observations)
+            write_json(args.output / "calibration_events.json", raw)
             common = dict(
                 model_config={
                     **manifest["model_config"],
@@ -224,12 +231,21 @@ def run_worker(args) -> None:
                 ],
             )
             profile["cost_profile_hash"] = profile_fingerprint(profile)
-            write_cost_profile(args.output / "cost_profile.json", profile)
-            write_json(args.output / "observations.json", observations)
-            write_json(args.output / "calibration_events.json", raw)
+            publish_profile(
+                args.output / "cost_profile.json",
+                profile,
+                thresholds=thresholds_from_args(args),
+                attempt=args.profiling_attempt,
+            )
     shutdown_slackpipe_runtime()
     parallel_state.destroy_model_parallel()
     dist.destroy_process_group()
+    if (
+        args.action == "calibrate"
+        and rank == 0
+        and not (args.output / "cost_profile.json").is_file()
+    ):
+        raise SystemExit(2)
 
 
 def main() -> None:

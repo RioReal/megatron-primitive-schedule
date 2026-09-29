@@ -270,7 +270,15 @@ def validate_target_plan(path: Path, profile_path: Path, manifest_path: Path, se
 
 
 def main() -> None:
+    from dataclasses import asdict
+
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+        add_quality_arguments,
+        thresholds_from_args,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
+    add_quality_arguments(parser)
     parser.add_argument("stage", choices=(*STAGES, "nccl-sanity"))
     parser.add_argument(
         "--output", type=Path, default=Path("/workspace/slackpipe-runs/nemotron-h8b")
@@ -310,6 +318,7 @@ def main() -> None:
     args.output = args.output.resolve()
     output, stage = args.output, args.stage
     expected = context(args)
+    expected["profiling_quality"] = asdict(thresholds_from_args(args))
     if args.dry_run:
         print(
             json.dumps(
@@ -402,6 +411,10 @@ def main() -> None:
         )
         execute(launch_command(options), stage)
     elif stage == "solve":
+        execute(
+            [sys.executable, "-m", "tools.slackpipe_profile_quality", "--profile", profile],
+            "profile-quality",
+        )
         info = json.loads(subprocess.check_output([str(args.solver), "build-info"], text=True))
         if not info["ortools_enabled"]:
             raise RuntimeError("Joint CP-SAT requires an OR-Tools-enabled solver")
@@ -462,7 +475,19 @@ def main() -> None:
             if stage == "benchmark":
                 directory = directory / f"run{rep:03d}"
             execute(
-                torchrun
+                (
+                    [
+                        sys.executable,
+                        "-m",
+                        "tools.slackpipe_profile_quality",
+                        "--collect-output",
+                        directory,
+                        "--",
+                    ]
+                    if stage == "calibrate"
+                    else []
+                )
+                + torchrun
                 + [
                     "-m",
                     "tools.slackpipe_nemotron_worker",
@@ -489,7 +514,16 @@ def main() -> None:
                     str(args.profiler_active),
                     "--profiler-repeat",
                     str(args.profiler_repeat),
-                ],
+                ]
+                + (
+                    [
+                        item
+                        for key, value in asdict(thresholds_from_args(args)).items()
+                        for item in (f"--quality-{key.replace('_', '-')}", str(value))
+                    ]
+                    if stage == "calibrate"
+                    else []
+                ),
                 f"{stage}-{mode}-run{rep:03d}",
             )
             artifacts.extend(directory.rglob("*.json"))

@@ -116,8 +116,16 @@ phase_limit = remaining_global_time / remaining_planned_phases
 
 The method stops after the first complete round with no strict makespan
 improvement, after the maximum rounds, or when the global deadline expires. A
-failed, invalid, or cap-violating phase never replaces the incumbent. Ties are
-deterministic.
+failed, invalid, or cap-violating phase never replaces the incumbent. Equal
+makespans are rejected, including lexicographically smaller partitions/orders.
+This is **complete-round** stopping, not stopping after the first unsuccessful
+phase. Canonical output records both acceptance and stopping rules. Obtaining
+the first cap-feasible solution when the initial baseline violates the cap is
+initialization, not a plateau move between feasible incumbents.
+
+Historical results predating these explicit rules may include deterministic
+equal-makespan exchanges. They must not be relabeled as strict-alternating results
+or as current-revision measurements without rerunning the affected comparison.
 
 ## Joint Semantics
 

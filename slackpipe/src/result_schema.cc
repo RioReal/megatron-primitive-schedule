@@ -837,6 +837,13 @@ CanonicalResultMetadata BuildCanonicalResultMetadata(
   metadata.semantics = semantics;
   ApplyFifoDefaults(instance, &metadata.semantics);
   metadata.outcome = outcome;
+  metadata.lower_bound_report = ComputeLowerBoundReport(
+      instance, outcome.best_objective_bound,
+      outcome.feasible.value_or(false) ? outcome.makespan : std::nullopt,
+      (semantics.canonical_method == "joint-unrestricted-no-overlap" ||
+       semantics.canonical_method == "canonical-slackpipe-global") &&
+          !semantics.worker_balance_pruning_enabled &&
+          !semantics.predecessor_candidate_restriction_active);
   if (selected_partition && !selected_partition->empty()) {
     metadata.selected_partition = selected_partition;
   }
@@ -1593,6 +1600,12 @@ std::string CanonicalResultToJson(const CanonicalResultMetadata &metadata,
   out << nested << "\"alternating_convergence_reason\": ";
   WriteOptionalString(out, metadata.alternating_convergence_reason);
   out << ",\n";
+  out << nested << "\"alternating_acceptance_rule\": ";
+  WriteOptionalString(out, metadata.alternating_acceptance_rule);
+  out << ",\n";
+  out << nested << "\"alternating_stop_rule\": ";
+  WriteOptionalString(out, metadata.alternating_stop_rule);
+  out << ",\n";
   out << nested << "\"alternating_trace\": ";
   WriteAlternatingTrace(out, metadata.alternating_trace, nested);
   out << ",\n";
@@ -1790,6 +1803,12 @@ std::string CanonicalResultToJson(const CanonicalResultMetadata &metadata,
   out << nested << "\"relative_optimality_gap\": ";
   WriteOptionalNumber(out, outcome.relative_optimality_gap);
   out << ",\n";
+  auto bound_report = metadata.lower_bound_report;
+  if (!outcome.feasible.value_or(false) || !outcome.makespan || *outcome.makespan <= 0) {
+    bound_report.effective_relative_gap = std::nullopt;
+  }
+  out << nested << "\"lower_bound_report\": "
+      << LowerBoundReportJson(bound_report) << ",\n";
   out << nested << "\"optimality_proof_source\": ";
   WriteOptionalString(out, outcome.optimality_proof_source);
   out << ",\n";

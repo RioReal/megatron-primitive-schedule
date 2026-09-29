@@ -300,7 +300,9 @@ const std::vector<EvaluationMethodDefinition>& EvaluationMethodRegistry() {
           true,
           false,
           true,
-          "alternate fixed-order partition and fixed-split schedule phases",
+          "alternate fixed-order partition and fixed-split schedule phases; "
+          "accept strict makespan decreases only; reject plateau exchanges; "
+          "stop after the first complete round without improvement",
           "one global deadline; each phase cap is remaining time divided by "
           "remaining planned phases",
           "partition phases preserve the current worker-local order exactly; "

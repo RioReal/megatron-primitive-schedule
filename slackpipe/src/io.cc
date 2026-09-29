@@ -730,6 +730,17 @@ std::string ToJson(const Instance &instance,
     out << CanonicalResultTopLevelJsonFields(*result.canonical, "  ", true);
   }
   out << "  \"algorithm\": \"optimize-joint\",\n";
+  out << "  \"workload_constraint_count\": " << result.workload_constraint_count << ",\n";
+  auto bound_report = result.canonical ? result.canonical->lower_bound_report : ComputeLowerBoundReport(
+      instance, result.best_bound_ticks,
+      (result.status == "OPTIMAL" || result.status == "FEASIBLE") && result.makespan_ticks > 0
+          ? std::optional<Tick>(result.makespan_ticks) : std::nullopt,
+      result.raw_bound_globally_valid);
+  if (result.canonical && (!result.canonical->outcome.feasible.value_or(false) ||
+      !result.canonical->outcome.makespan || *result.canonical->outcome.makespan <= 0)) {
+    bound_report.effective_relative_gap = std::nullopt;
+  }
+  out << "  \"lower_bound_report\": " << LowerBoundReportJson(bound_report) << ",\n";
   out << "  \"status\": \"" << JsonEscape(result.status) << "\",\n";
   out << "  \"proven_optimal\": " << (result.proven_optimal ? "true" : "false")
       << ",\n";
@@ -1046,6 +1057,16 @@ std::string ToJson(const Instance &instance,
 std::string ToJson(const Instance &instance, const SlackPipeResult &result) {
   std::ostringstream out;
   out << "{\n";
+  auto bound_report = result.canonical ? result.canonical->lower_bound_report : ComputeLowerBoundReport(
+      instance, result.best_bound_ticks,
+      (result.status == "OPTIMAL" || result.status == "FEASIBLE") && result.makespan_ticks > 0
+          ? std::optional<Tick>(result.makespan_ticks) : std::nullopt,
+      result.effective_split_mode == "global" && !result.worker_balance_constraint.enabled);
+  if (result.canonical && (!result.canonical->outcome.feasible.value_or(false) ||
+      !result.canonical->outcome.makespan || *result.canonical->outcome.makespan <= 0)) {
+    bound_report.effective_relative_gap = std::nullopt;
+  }
+  out << "  \"lower_bound_report\": " << LowerBoundReportJson(bound_report) << ",\n";
   if (result.canonical) {
     out << CanonicalResultTopLevelJsonFields(*result.canonical, "  ", true);
   }

@@ -88,7 +88,10 @@ def synthetic(monkeypatch):
         directory.mkdir(parents=True)
         a = self.args
         if stage == "calibrate":
-            from megatron.core.pipeline_parallel.slackpipe.cost_profile import profile_fingerprint
+            from megatron.core.pipeline_parallel.slackpipe.profile_quality import publish_profile
+            from tests.unit_tests.pipeline_parallel.test_slackpipe_profile_quality import (
+                stable_profile,
+            )
 
             profile = dict(
                 schema_version="slackpipe.cost_profile.v1",
@@ -100,8 +103,10 @@ def synthetic(monkeypatch):
                 ),
                 parallel_config={k: self.topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")},
             )
-            profile["cost_profile_hash"] = profile_fingerprint(profile)
-            write_json(directory / "cost_profile.json", profile)
+            profile.update(stable_profile())
+            publish_profile(
+                directory / "cost_profile.json", profile, attempt=kwargs.get("attempt", 0)
+            )
         else:
             config = dict(
                 self.topology,
@@ -325,12 +330,55 @@ def test_legacy_unsafe_reuse_rejected(tmp_path, synthetic, damage):
     assert before == synthetic
 
 
-def test_legacy_source_fix_boundary():
+def test_legacy_source_fix_boundary(monkeypatch):
+    # Exercise the audited boundary independently of newer worker changes in this checkout.
+    monkeypatch.setattr(
+        "tools.slackpipe_eval_receipts.subprocess.check_output", lambda *a, **k: b""
+    )
+    monkeypatch.setattr("tools.slackpipe_eval_receipts.subprocess.check_call", lambda *a, **k: 0)
     assert legacy_source_compatible(dict(commit=LEGACY_COMMIT, diff=EMPTY_DIFF), dict(commit="new"))
     assert not legacy_source_compatible(
         dict(commit=LEGACY_COMMIT, diff="dirty"), dict(commit="new")
     )
     assert not legacy_source_compatible(dict(commit="unknown", diff=EMPTY_DIFF), dict(commit="new"))
+    monkeypatch.setattr(
+        "tools.slackpipe_eval_receipts.subprocess.check_output", lambda *a, **k: b"worker changed"
+    )
+    assert not legacy_source_compatible(
+        dict(commit=LEGACY_COMMIT, diff=EMPTY_DIFF), dict(commit="new")
+    )
+
+
+def test_failed_reprofiling_prevents_campaign_solver(tmp_path, synthetic, monkeypatch):
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+        ProfilingQualityError,
+        publish_profile,
+    )
+    from tests.unit_tests.pipeline_parallel.test_slackpipe_profile_quality import shifted_profile
+
+    original = Experiment._worker
+    attempts = []
+
+    def worker(self, stage, directory, **kwargs):
+        if stage != "calibrate":
+            return original(self, stage, directory, **kwargs)
+        attempts.append(kwargs["attempt"])
+        publish_profile(
+            directory / "cost_profile.json", shifted_profile(), attempt=kwargs["attempt"]
+        )
+
+    monkeypatch.setattr(Experiment, "_worker", worker)
+    experiment = Experiment(args_for(tmp_path, "solve"))
+    with (
+        pytest.warns(RuntimeWarning),
+        pytest.raises(ProfilingQualityError, match="retry exhausted"),
+    ):
+        experiment.execute()
+    assert attempts == [0, 1]
+    assert synthetic["solve"] == 0
+    receipt = json.loads(experiment.receipt_path("calibrate").read_text())
+    assert receipt["status"] == "rerun_required"
+    assert any("profiling_attempts.json" in path for path in receipt["artifacts"])
 
 
 def test_inspect_is_read_only_and_explains(tmp_path, synthetic):
@@ -439,6 +487,10 @@ def test_solver_binary_hash_invalidates_only_solve_downstream(tmp_path, syntheti
 
 
 def test_legacy_across_receipt_only_source_fix(tmp_path, synthetic, monkeypatch):
+    monkeypatch.setattr(
+        "tools.slackpipe_eval_receipts.subprocess.check_output", lambda *a, **k: b""
+    )
+    monkeypatch.setattr("tools.slackpipe_eval_receipts.subprocess.check_call", lambda *a, **k: 0)
     base = Experiment._base_context
 
     def identity(self):

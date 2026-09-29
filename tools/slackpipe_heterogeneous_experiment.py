@@ -29,7 +29,6 @@ from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
     build_heterogeneous_cost_profile,
     profile_fingerprint,
     stage_role,
-    write_cost_profile,
 )
 from megatron.core.pipeline_parallel.slackpipe.manifest import (
     build_model_manifest,
@@ -84,7 +83,15 @@ def select_partitions(manifest, minimum=6):
 
 
 def main():
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+        add_quality_arguments,
+        publish_profile,
+        tag_calibration_events,
+        thresholds_from_args,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
+    add_quality_arguments(parser)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--warmup-iterations", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=10)
@@ -190,6 +197,26 @@ def main():
                 finally:
                     events.extend(end_slackpipe_cost_calibration_iteration())
             bench._assert_finite(losses, bench._logical_params(model))
+            tag_calibration_events(
+                events,
+                group=str(partition_id),
+                ranges=list(zip(cuts, cuts[1:])),
+                worker=rank,
+                attempt=args.profiling_attempt,
+                raw_path=args.output_dir / "calibration_events.json",
+                configuration=dict(
+                    manifest=manifest["manifest_hash"],
+                    seq_length=args.seq_length,
+                    dtype="fp32",
+                    microbatches=4,
+                    seed=args.seed,
+                    learning_rate=args.learning_rate,
+                    warmups=args.warmup_iterations,
+                    iterations=args.iterations,
+                    environment=bench.environment_metadata(),
+                    timing="synchronized-stage-wall-time-v1",
+                ),
+            )
             gathered = [None] * 2
             dist.all_gather_object(gathered, events)
             rank_metadata = [None] * 2
@@ -238,6 +265,10 @@ def main():
             json.dumps(actual_layers, indent=2)
         )
         if rank == 0:
+            (args.output_dir / "calibration_events.json").write_text(
+                json.dumps(raw_events, indent=2)
+            )
+            (args.output_dir / "observations.json").write_text(json.dumps(observed, indent=2))
             profile = build_heterogeneous_cost_profile(
                 model_manifest=manifest,
                 observed_stage_rows=observed,
@@ -281,9 +312,11 @@ def main():
                     [r[f"{phase}_us"] for r in profile["layer_costs_us"]],
                     rtol=1e-12,
                 )
-            write_cost_profile(args.output_dir / "cost_profile.json", profile)
-            (args.output_dir / "calibration_events.json").write_text(
-                json.dumps(raw_events, indent=2)
+            publish_profile(
+                args.output_dir / "cost_profile.json",
+                profile,
+                thresholds=thresholds_from_args(args),
+                attempt=args.profiling_attempt,
             )
             print(
                 json.dumps(
@@ -301,6 +334,8 @@ def main():
         parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
         if dist.is_initialized():
             dist.destroy_process_group()
+    if rank == 0 and not (args.output_dir / "cost_profile.json").is_file():
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

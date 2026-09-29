@@ -6,8 +6,14 @@ import json
 import os
 import sys
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
+from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+    ProfilingQualityError,
+    add_quality_arguments,
+    thresholds_from_args,
+)
 from tools.run_slackpipe_nemotron_h8b_pp4 import DETERMINISTIC, ROOT, digest, run, source_identity
 from tools.slackpipe_eval_config import (
     SCHEDULES,
@@ -24,6 +30,7 @@ from tools.slackpipe_eval_receipts import (
     receipt_valid,
 )
 from tools.slackpipe_hybrid import write_json
+from tools.slackpipe_profile_quality import collect_with_retry
 
 STAGES = (
     "env",
@@ -40,6 +47,7 @@ STAGES = (
 
 def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_quality_arguments(parser)
     parser.add_argument("stage", choices=STAGES)
     parser.add_argument("--model-config", type=Path, required=True)
     parser.add_argument("--schedule", choices=SCHEDULES, default="slackpipe")
@@ -274,6 +282,9 @@ class Experiment:
                     else "uniform"
                 ),
                 estimator="existing-stage-wall-time-v1",
+                quality=asdict(thresholds_from_args(args)),
+                quality_schema="slackpipe.profile_quality.v1",
+                automatic_retry_limit=1,
             )
         elif stage == "solve":
             context.update(
@@ -329,7 +340,17 @@ class Experiment:
     def _execute(self, command, directory, name):
         run(command, directory / f"{name}.log", self.args.timeout, self.env)
 
-    def _worker(self, stage, directory, *, schedule=None, plan=None, profile=None, iterations=None):
+    def _worker(
+        self,
+        stage,
+        directory,
+        *,
+        schedule=None,
+        plan=None,
+        profile=None,
+        iterations=None,
+        attempt=0,
+    ):
         args = self.args
         warmups = {
             "calibrate": args.calibration_warmups,
@@ -389,6 +410,10 @@ class Experiment:
         ]
         if plan:
             command += ["--plan", plan, "--profile", profile]
+        if stage == "calibrate":
+            command += ["--profiling-attempt", attempt]
+            for key, value in asdict(thresholds_from_args(args)).items():
+                command += [f"--quality-{key.replace('_', '-')}", value]
         self._execute(command, directory.parent, directory.name)
 
     def ensure(self, stage):
@@ -513,24 +538,30 @@ class Experiment:
                 result["scope"] = (
                     "small hybrid numerical-equivalence fixture at requested PP/precision; target model validated separately by smoke"
                 )
-            elif stage in ("smoke", "native-smoke", "calibrate"):
+            elif stage == "calibrate":
+                native = "1f1b" if args.logical_stages == args.pp else "interleaved"
+                selected = collect_with_retry(
+                    directory,
+                    lambda worker, attempt: self._worker(
+                        "calibrate",
+                        worker,
+                        schedule=native,
+                        iterations=args.calibration_iterations,
+                        attempt=attempt,
+                    ),
+                    context,
+                )
+                result["profile"] = str(selected.relative_to(self.output))
+            elif stage in ("smoke", "native-smoke"):
                 native = "1f1b" if args.logical_stages == args.pp else "interleaved"
                 self._worker(
                     "smoke" if stage == "native-smoke" else stage,
                     directory / "worker",
-                    schedule=native if stage in ("native-smoke", "calibrate") else args.schedule,
+                    schedule=native if stage == "native-smoke" else args.schedule,
                     plan=plan,
                     profile=profile,
-                    iterations=(
-                        args.calibration_iterations
-                        if stage == "calibrate"
-                        else args.smoke_iterations
-                    ),
+                    iterations=args.smoke_iterations,
                 )
-                if stage == "calibrate":
-                    result["profile"] = str(
-                        (directory / "worker/cost_profile.json").relative_to(self.output)
-                    )
             elif stage == "solve":
                 from megatron.core.pipeline_parallel.slackpipe.plan import load_slackpipe_plan
                 from tools.slackpipe_eval_worker import validate_profile
@@ -635,7 +666,15 @@ class Experiment:
                 if p.is_file()
             }
         except Exception as exc:
-            result.update(status="failed", error=str(exc))
+            result.update(
+                status="rerun_required" if isinstance(exc, ProfilingQualityError) else "failed",
+                error=str(exc),
+            )
+            result["artifacts"] = {
+                str(p.relative_to(self.output)): digest(p)
+                for p in directory.rglob("*")
+                if p.is_file()
+            }
             write_json(receipt_path, result)
             raise
         write_json(receipt_path, result)

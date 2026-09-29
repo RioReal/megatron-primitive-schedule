@@ -145,8 +145,9 @@ def test_memory_gate_does_not_shrink():
     assert model == original
 
 
-def test_profile_rejects_mismatch():
-    from megatron.core.pipeline_parallel.slackpipe.cost_profile import profile_fingerprint
+def test_profile_rejects_mismatch(tmp_path):
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import publish_profile
+    from tests.unit_tests.pipeline_parallel.test_slackpipe_profile_quality import stable_profile
 
     model = tiny_model("llama")
     topology = schedule_topology("interleaved", 2, 4, 4)
@@ -159,7 +160,8 @@ def test_profile_rejects_mismatch():
         ),
         parallel_config={k: topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")},
     )
-    profile["cost_profile_hash"] = profile_fingerprint(profile)
+    profile.update(stable_profile())
+    publish_profile(tmp_path / "cost_profile.json", profile)
     validate_profile(profile, model, topology, "fp32", 32, 1)
     for precision, seq, micro in (("bf16", 32, 1), ("fp32", 64, 1), ("fp32", 32, 2)):
         with pytest.raises(ValueError, match="mismatch"):

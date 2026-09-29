@@ -319,6 +319,15 @@ def run_solver(
     require_optimal: bool = False,
 ) -> Path:
     prefix = root / "solver" / name / name
+    if cost_profile is not None:
+        payload = read_json(cost_profile)
+        source = Path(payload.get("derived_from", cost_profile))
+        if source != cost_profile and payload.get("source_digest") != file_digest(source):
+            raise RuntimeError("Derived ablation profile has stale/missing calibration provenance")
+        docker_exec(
+            f"cd {CONTAINER_REPO} && python -m tools.slackpipe_profile_quality --profile {shlex.quote(container_path(source))}",
+            log_path=root / "logs" / f"profile_quality_{name}.log",
+        )
     plan = root / "plans" / f"{name}.plan.json"
     meta = {
         "kind": "solver",
@@ -369,6 +378,7 @@ def calibrate(
     meta = {
         "kind": "calibration",
         "collection_schema": "slackpipe.collection.v1",
+        "quality_schema": "slackpipe.profile_quality.v1",
         "config": asdict(cfg),
         "seed_plan_digest": file_digest(seed_plan),
         "warmups": warmups,
@@ -382,7 +392,9 @@ def calibrate(
     script = (
         f"cd {CONTAINER_REPO} && "
         f"mkdir -p {container_path(root / 'calibration')} {container_path(root / 'cost_profiles')} && "
-        "CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run "
+        "CUDA_VISIBLE_DEVICES=0,1 python -m tools.slackpipe_profile_quality "
+        f"--collect-output {container_path(root / 'calibration')} --selected-profile {container_path(profile)} -- "
+        "python -m torch.distributed.run "
         f"--master_port {next_port(cfg.name, 'calibration')} --nproc_per_node=2 "
         "tests/unit_tests/pipeline_parallel/slackpipe_perf_benchmark.py "
         f"--plan {container_path(seed_plan)} "
@@ -415,6 +427,7 @@ def derive_cost_profiles(full_profile: Path, root: Path, force: bool) -> dict[st
         "percentile": None,
         "observed_stages": full["observed_stages"],
         "units": "milliseconds",
+        "source_digest": file_digest(full_profile),
     }
     profiles: dict[str, Path | None] = {"M0_equal": None}
     variants = {

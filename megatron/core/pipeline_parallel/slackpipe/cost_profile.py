@@ -79,6 +79,7 @@ def aggregate_stage_costs(
         raise ValueError("iteration range must be non-empty")
     num_stages = len(layer_split)
     totals = defaultdict(lambda: {"forward": 0.0, "backward": 0.0})
+    provenance = {}
 
     for event in events:
         phase = event.get("phase")
@@ -90,6 +91,22 @@ def aggregate_stage_costs(
             raise ValueError(f"logical stage {stage} is out of range")
         if iteration not in iterations:
             continue
+        identity = {
+            k: event[k]
+            for k in (
+                "calibration_group_id",
+                "attempt",
+                "worker",
+                "stage_layer_range",
+                "stage_role",
+                "measurement_context",
+                "raw_data_path",
+            )
+            if k in event
+        }
+        if stage in provenance and provenance[stage] != identity:
+            raise ValueError("Cannot aggregate different calibration groups or contexts together")
+        provenance[stage] = identity
         key = (iteration, stage)
         if phase == "forward_compute":
             totals[key]["forward"] += float(event["elapsed_ms"])
@@ -138,6 +155,7 @@ def aggregate_stage_costs(
                 "backward_forward_ratio": backward_op / forward_op if forward_op else None,
                 "forward_diagnostics": diagnostics(forward_totals),
                 "backward_diagnostics": diagnostics(backward_totals),
+                **provenance.get(stage, {}),
             }
         )
     return rows

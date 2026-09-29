@@ -164,7 +164,19 @@ def launch_command(args):
 
 
 def main():
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+        ProfilingQualityError,
+        add_quality_arguments,
+        publish_profile,
+        thresholds_from_args,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
+    add_quality_arguments(parser)
+    parser.add_argument(
+        "--profiling-rerun-command",
+        help="Exact collection command with a fresh output directory; required for offline fit",
+    )
     parser.add_argument("action", choices=("manifest", "fit", "baseline", "slackpipe"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -192,6 +204,10 @@ def main():
     if args.action in ("manifest", "fit"):
         payload = manifest
         if args.action == "fit":
+            if not args.profiling_rerun_command:
+                parser.error(
+                    "fit requires --profiling-rerun-command: the original profiling invocation, not a refit command"
+                )
             if not args.observations:
                 parser.error("fit requires --observations")
             if (
@@ -214,7 +230,20 @@ def main():
                 },
             )
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, indent=2) + "\n")
+        if args.action == "fit":
+            report = publish_profile(
+                args.output,
+                payload,
+                thresholds=thresholds_from_args(args),
+                attempt=args.profiling_attempt,
+                command=args.profiling_rerun_command,
+            )
+            if report["status"] != "passed":
+                raise ProfilingQualityError(
+                    "Profiling rerun required; offline fit cannot launch measurement"
+                )
+        else:
+            args.output.write_text(json.dumps(payload, indent=2) + "\n")
         source = args.manifest or NEMOTRON_H_8B_SOURCE
         print(f"Wrote {args.output}; architecture source: {source}")
         return

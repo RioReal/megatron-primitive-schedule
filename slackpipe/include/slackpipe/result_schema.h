@@ -13,6 +13,7 @@
 #include "slackpipe/partition_restriction.h"
 #include "slackpipe/result_validator.h"
 #include "slackpipe/worker_balance.h"
+#include "slackpipe/workload_bound.h"
 
 namespace slackpipe {
 
@@ -209,12 +210,15 @@ struct CanonicalResultMetadata {
   std::optional<Index> alternating_max_rounds;
   std::optional<Index> alternating_completed_rounds;
   std::optional<std::string> alternating_convergence_reason;
+  std::optional<std::string> alternating_acceptance_rule;
+  std::optional<std::string> alternating_stop_rule;
   std::vector<CanonicalAlternatingTraceEntry> alternating_trace;
   std::optional<Tick> intermediate_partition_only_makespan;
   std::string method_contract_hash;
 
   CanonicalSemantics semantics;
   CanonicalOutcome outcome;
+  LowerBoundReport lower_bound_report;
 
   std::optional<std::vector<Tick>> selected_partition;
   std::optional<std::vector<std::vector<std::string>>>

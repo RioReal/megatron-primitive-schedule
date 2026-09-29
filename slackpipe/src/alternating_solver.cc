@@ -494,7 +494,8 @@ AlternatingOptimizationResult OptimizeAlternatingPartitionSchedule(
     if (deadline.bounded())
       partition_trace.phase_limit_seconds = partition_limit;
     partition_trace.phase_runtime_seconds = Since(partition_started);
-    partition_trace.input_makespan = result.makespan_ticks;
+    partition_trace.input_makespan = current_cap_feasible
+        ? std::optional<Tick>(result.makespan_ticks) : std::nullopt;
     partition_trace.candidate_makespan =
         Feasible(partition.status)
             ? std::optional<Tick>(partition.makespan_ticks)
@@ -525,11 +526,9 @@ AlternatingOptimizationResult OptimizeAlternatingPartitionSchedule(
                               instance, partition.schedule,
                               options.activation_options, &partition_trace);
       if (validation.passed && cap_ok) {
-        bool strict = false;
-        if (!current_cap_feasible ||
-            BetterOrTie(partition.schedule, partition.split,
-                        partition.machine_orders, result.schedule, result.split,
-                        result.machine_orders, &strict)) {
+        const bool strict = !current_cap_feasible ||
+                            partition.schedule.makespan < result.makespan_ticks;
+        if (strict) {
           AcceptCandidate(result, partition.split, partition.machine_orders,
                           partition.schedule, "partition_fixed_order_phase");
           partition_trace.accepted = true;
@@ -558,7 +557,8 @@ AlternatingOptimizationResult OptimizeAlternatingPartitionSchedule(
     schedule_trace.phase_type = "schedule_fixed_split";
     if (deadline.bounded()) schedule_trace.phase_limit_seconds = schedule_limit;
     schedule_trace.phase_runtime_seconds = Since(schedule_started);
-    schedule_trace.input_makespan = result.makespan_ticks;
+    schedule_trace.input_makespan = current_cap_feasible
+        ? std::optional<Tick>(result.makespan_ticks) : std::nullopt;
     schedule_trace.candidate_makespan =
         Feasible(schedule.status) ? std::optional<Tick>(schedule.makespan_ticks)
                                   : std::nullopt;
@@ -592,11 +592,9 @@ AlternatingOptimizationResult OptimizeAlternatingPartitionSchedule(
                                    instance, schedule.schedule,
                                    options.activation_options, &schedule_trace);
       if (validation.passed && cap_ok) {
-        bool strict = false;
-        if (!current_cap_feasible ||
-            BetterOrTie(schedule.schedule, schedule.split,
-                        schedule.machine_orders, result.schedule, result.split,
-                        result.machine_orders, &strict)) {
+        const bool strict = !current_cap_feasible ||
+                            schedule.schedule.makespan < result.makespan_ticks;
+        if (strict) {
           AcceptCandidate(result, schedule.split, schedule.machine_orders,
                           schedule.schedule, schedule.solution_source);
           schedule_trace.accepted = true;
@@ -691,6 +689,10 @@ void ApplyAlternatingCanonicalFields(
   metadata.alternating_convergence_reason =
       result.alternating_convergence_reason;
   metadata.alternating_trace = result.alternating_trace;
+  if (result.method == "alternating-partition-schedule") {
+    metadata.alternating_acceptance_rule = "strict_makespan_decrease_no_plateau_moves";
+    metadata.alternating_stop_rule = "first_complete_round_without_strict_improvement";
+  }
   if (result.intermediate_partition_only_makespan > 0) {
     metadata.intermediate_partition_only_makespan =
         result.intermediate_partition_only_makespan;
