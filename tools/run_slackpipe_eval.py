@@ -16,7 +16,9 @@ from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
 )
 from tools.run_slackpipe_nemotron_h8b_pp4 import DETERMINISTIC, ROOT, digest, run, source_identity
 from tools.slackpipe_eval_config import (
+    PLAN_SCHEDULES,
     SCHEDULES,
+    canonical_schedule,
     fingerprint,
     load_model,
     parameter_breakdown,
@@ -50,7 +52,9 @@ def argument_parser() -> argparse.ArgumentParser:
     add_quality_arguments(parser)
     parser.add_argument("stage", choices=STAGES)
     parser.add_argument("--model-config", type=Path, required=True)
-    parser.add_argument("--schedule", choices=SCHEDULES, default="slackpipe")
+    parser.add_argument(
+        "--schedule", type=canonical_schedule, choices=SCHEDULES, default="slackpipe"
+    )
     parser.add_argument("--pp", type=int, default=4)
     parser.add_argument("--logical-stages", type=int)
     parser.add_argument("--microbatches", type=int, default=8)
@@ -88,14 +92,15 @@ def argument_parser() -> argparse.ArgumentParser:
 
 
 def normalize_args(args):
+    args.schedule = canonical_schedule(args.schedule)
     model = load_model(args.model_config)
     for field in ("seq_length", "precision", "micro_batch_size"):
         if getattr(args, field) is None:
             setattr(args, field, model["defaults"][field])
     topology = schedule_topology(args.schedule, args.pp, args.logical_stages, args.microbatches)
-    args.logical_stages = topology["num_stages"]
+    args.logical_stages = topology.get("base_N", topology["num_stages"])
     if (
-        args.logical_stages > model["num_layers"]
+        topology["num_stages"] > model["num_layers"]
         or not 1 <= args.seq_length <= model["max_sequence_length"]
     ):
         raise ValueError("Invalid stages/sequence for model")
@@ -209,7 +214,7 @@ def benchmark_summary(results_by_run: list, global_batch_size: int, seq_length: 
 class Experiment:
     """Stage receipts bind source, model, measurement policy and prerequisite bytes."""
 
-    def __init__(self, args):
+    def __init__(self, args, *, shared_receipts=()):
         self.args = normalize_args(args)
         self.model = load_model(args.model_config)
         self.output = args.output
@@ -228,6 +233,8 @@ class Experiment:
         ]
         self.completed = {}
         self._identity = None
+        # Only receipts accepted earlier in this campaign may be shared without --resume.
+        self.shared_receipts = frozenset(Path(p).resolve() for p in shared_receipts)
 
     def _base_context(self):
         from megatron.core.pipeline_parallel.slackpipe.collection import environment_metadata
@@ -265,7 +272,7 @@ class Experiment:
             context.update(seed=args.seed, learning_rate=args.learning_rate)
         if stage not in ("env", "correctness", "solve"):
             context["schedule"] = (
-                ("1f1b" if args.logical_stages == args.pp else "interleaved")
+                ("1f1b" if self.topology["num_stages"] == args.pp else "interleaved")
                 if stage in ("native-smoke", "calibrate")
                 else args.schedule
             )
@@ -290,11 +297,19 @@ class Experiment:
             context.update(
                 solver_sha256=digest(args.solver) if args.solver.is_file() else None,
                 solver_seconds=args.solver_seconds,
-                solver_algorithm="joint-unrestricted-no-overlap",
-                solver_workers=2,
+                solver_algorithm=(
+                    "octopipe-algorithm1-fixed-stage"
+                    if args.schedule == "octopipe"
+                    else "joint-unrestricted-no-overlap"
+                ),
+                solver_workers=1 if args.schedule == "octopipe" else 2,
                 require_optimal=False,
                 ratio=[1, 1],
             )
+            if args.schedule == "octopipe":
+                context.update(
+                    octopipe_fixed_placement=True, octopipe_initial_order="uniform-breadth-first"
+                )
         elif stage == "benchmark":
             policy = dict(warmups=args.warmups, iterations=args.iterations)
             context.update(
@@ -320,7 +335,7 @@ class Experiment:
         return context
 
     def dependencies(self, stage):
-        optimized = self.args.schedule in ("slackpipe", "optimized_interleaved")
+        optimized = self.args.schedule in PLAN_SCHEDULES
         return {
             "env": (),
             "correctness": ("env",),
@@ -376,7 +391,11 @@ class Experiment:
             "--pp",
             args.pp,
             "--logical-stages",
-            args.logical_stages,
+            (
+                args.logical_stages
+                if (schedule or args.schedule) == "slackpipe-refined"
+                else self.topology["num_stages"]
+            ),
             "--microbatches",
             args.microbatches,
             "--micro-batch-size",
@@ -420,7 +439,7 @@ class Experiment:
         if stage in self.completed:
             return self.completed[stage]
         args = self.args
-        optimized = args.schedule in ("slackpipe", "optimized_interleaved")
+        optimized = args.schedule in PLAN_SCHEDULES
         parents = {p: self.ensure(p) for p in self.dependencies(stage)}
         if any(p["status"] != "passed" for p in parents.values()):
             result = dict(
@@ -460,10 +479,12 @@ class Experiment:
                     "use --resume for compatible reuse/new v2 context, or --force for an explicit new attempt"
                 )
             archive_receipt(receipt_path, receipt)
-        elif args.resume:
+        elif args.resume or self.shared_receipts:
             # Shared native prerequisites keep separate schedule namespaces, but reuse exact bytes.
             if stage in ("env", "correctness", "native-smoke", "calibrate", "solve"):
                 for candidate in sorted(receipt_path.parent.glob(f"*.{stage}.json")):
+                    if not args.resume and candidate.resolve() not in self.shared_receipts:
+                        continue
                     receipt = json.loads(candidate.read_text())
                     state, _, _ = assess_receipt(receipt, context, self.output, parents)
                     if state == "compatible":
@@ -539,7 +560,7 @@ class Experiment:
                     "small hybrid numerical-equivalence fixture at requested PP/precision; target model validated separately by smoke"
                 )
             elif stage == "calibrate":
-                native = "1f1b" if args.logical_stages == args.pp else "interleaved"
+                native = "1f1b" if self.topology["num_stages"] == args.pp else "interleaved"
                 selected = collect_with_retry(
                     directory,
                     lambda worker, attempt: self._worker(
@@ -553,7 +574,7 @@ class Experiment:
                 )
                 result["profile"] = str(selected.relative_to(self.output))
             elif stage in ("smoke", "native-smoke"):
-                native = "1f1b" if args.logical_stages == args.pp else "interleaved"
+                native = "1f1b" if self.topology["num_stages"] == args.pp else "interleaved"
                 self._worker(
                     "smoke" if stage == "native-smoke" else stage,
                     directory / "worker",
@@ -563,7 +584,10 @@ class Experiment:
                     iterations=args.smoke_iterations,
                 )
             elif stage == "solve":
-                from megatron.core.pipeline_parallel.slackpipe.plan import load_slackpipe_plan
+                from megatron.core.pipeline_parallel.slackpipe.plan import (
+                    load_slackpipe_plan,
+                    validate_cyclic_placement,
+                )
                 from tools.slackpipe_eval_worker import validate_profile
 
                 profile = self.output / self.completed["calibrate"]["profile"]
@@ -581,11 +605,11 @@ class Experiment:
                     [
                         args.solver,
                         "--algorithm",
-                        "joint-unrestricted-no-overlap",
+                        context["solver_algorithm"],
                         "--B",
                         args.microbatches,
                         "--N",
-                        args.logical_stages,
+                        self.topology["num_stages"],
                         "--J",
                         args.pp,
                         "--L",
@@ -597,7 +621,7 @@ class Experiment:
                         "--time-limit-seconds",
                         args.solver_seconds,
                         "--num-workers",
-                        2,
+                        context["solver_workers"],
                         "--random-seed",
                         args.seed,
                         "--require-optimal",
@@ -608,14 +632,20 @@ class Experiment:
                         directory / "solver",
                         "--emit-plan",
                         plan,
-                    ],
+                    ]
+                    + (
+                        ["--octopipe-fixed-placement", "true"]
+                        if args.schedule == "octopipe"
+                        else []
+                    ),
                     directory,
                     "solve",
                 )
                 parsed = load_slackpipe_plan(plan, pipeline_model_parallel_size=args.pp)
+                validate_cyclic_placement(parsed)
                 if (parsed.num_layers, parsed.num_stages, parsed.num_microbatches) != (
                     self.model["num_layers"],
-                    args.logical_stages,
+                    self.topology["num_stages"],
                     args.microbatches,
                 ):
                     raise ValueError("Solver plan dimensions differ from experiment")
@@ -729,7 +759,7 @@ class Experiment:
 
         stages = (
             ("solve", "benchmark", "trace")
-            if self.args.schedule in ("slackpipe", "optimized_interleaved")
+            if self.args.schedule in PLAN_SCHEDULES
             else ("benchmark", "trace")
         )
         for stage in stages:

@@ -501,7 +501,7 @@ def test_slackpipe_pp2_numerical_equivalence(tmp_path):
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=2,
-        virtual_pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=parsed_plan.num_stages // 2,
     )
 
     try:
@@ -558,7 +558,7 @@ def test_slackpipe_pp2_numerical_equivalence(tmp_path):
             slackpipe_transport=os.environ.get("SLACKPIPE_TEST_TRANSPORT", "nccl-p2p"),
         )(
             forward_step_func=_forward_step_func,
-            data_iterator=[_batch_iterator(batches) for _ in range(2)],
+            data_iterator=[_batch_iterator(batches) for _ in slackpipe_model],
             model=slackpipe_model,
             num_microbatches=num_microbatches,
             seq_length=8,

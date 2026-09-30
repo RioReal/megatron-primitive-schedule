@@ -79,7 +79,7 @@ std::vector<Tick> StageToWorker(const Instance& instance) {
   std::vector<Tick> stage_to_worker;
   stage_to_worker.reserve(static_cast<std::size_t>(instance.stages));
   for (Index stage = 0; stage < instance.stages; ++stage) {
-    stage_to_worker.push_back(stage % instance.workers);
+    stage_to_worker.push_back(instance.WorkerForStage(stage));
   }
   return stage_to_worker;
 }

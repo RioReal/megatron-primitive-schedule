@@ -85,7 +85,7 @@ python -m tools.run_slackpipe_eval full \
 
 python -m tools.run_slackpipe_real_system_campaign \
   --families llama,nemotron_h --sizes 4b,8b,16b,30b \
-  --schedules 1f1b,interleaved,slackpipe --pp 4 --logical-stages 8 \
+  --schedules 1f1b,1f1b-interleave,octopipe,slackpipe,slackpipe-refined --pp 4 --logical-stages 8 \
   --microbatches 8 --seq-length 1024 --precision bf16 \
   --warmups 5 --iterations 50 --repetitions 3 \
   --solver slackpipe/build/release/slackpipe_cli --output slackpipe_eval --resume
@@ -102,16 +102,106 @@ standalone PP1 SlackPipe runtime tests remain available. Native PP1 is also usab
 | Method | Main topology | Actual scheduler |
 | --- | --- | --- |
 | `1f1b` | PP4, N4, VPP=None | `forward_backward_pipelining_without_interleaving` |
-| `interleaved` | PP4, N8, VPP2 | `forward_backward_pipelining_with_interleaving` |
+| `1f1b-interleave` (`interleaved`) | PP4, N8, VPP2 | `forward_backward_pipelining_with_interleaving` |
+| `octopipe` | PP4, N8, VPP2 | Common plan executor with OctoPipe Algorithm-1 fixed-stage orders |
 | `slackpipe` | PP4, N8, VPP2 | `forward_backward_slackpipe`, exported solver orders |
+| `slackpipe-refined` | PP4, N12, VPP3 | Identical SlackPipe solver and plan executor, with N+W stages |
 | `optimized_interleaved` (optional) | PP4, N8, VPP2 | Native interleaving with solver partition |
 
 1F1B versus SlackPipe is a **system-level comparison**, with different N/VPP.
 Interleaved versus SlackPipe is the better-controlled schedule comparison, though
-optimized partition effects remain. The optional fourth method separates the
-partition contribution from scheduling contribution.
+optimized partition effects remain. The five primary comparisons are native
+1F1B, interleaved 1F1B, OctoPipe, SlackPipe and SlackPipe-refined.
+`optimized_interleaved` remains an optional partition/scheduling ablation.
+`1f1b-interleave` is an alias; the existing `interleaved` receipt/output namespace
+is retained so old names and invocations continue to work.
+
+OctoPipe uses the existing `--algorithm octopipe-algorithm1-fixed-stage` tuner,
+with `--octopipe-fixed-placement true`: the real runtime supports cyclic
+placement only. It starts from uniform BFS and tunes partition/F-B order without
+changing the tuner. This is the restricted fixed-stage baseline, not full OctoPipe.
+The plan executor is shared with SlackPipe, but algorithm/method labels remain
+`octopipe` in benchmark and trace output. Noncyclic plans are rejected before
+launching GPU workers. Solver time and predicted makespan stay separate from
+measured training-step time.
+
+OctoPipe and SlackPipe share an accepted native calibration for the same model,
+topology and measurement policy, including the existing quality/retry gate.
+They have separate solver receipts binding algorithm, binary and plan; changing
+method cannot reuse the other solver's plan. The OctoPipe tuner requires no
+OR-Tools; the default five-way campaign still needs an OR-enabled binary for
+SlackPipe. No new performance results are implied by this integration.
+
+A fresh campaign shares only compatible prerequisites already accepted in the
+same invocation, with the usual source/configuration and artifact checksum
+checks. `--resume` is still required to reuse a previous campaign. Benchmark
+repetitions, method-specific smoke runs and timelines remain independent
+processes. Duplicate normalized configurations, aliases and output-directory
+collisions are rejected before GPU launches. Completed figures are reused before
+reading traces; incomplete figure outputs are regenerated. See the
+[orchestration audit](slackpipe_evaluation_overhead_audit.md) for scope, launch
+counts, measurements and validation limits.
+
+### SlackPipe-refined: Stage-count Alias
+
+`--logical-stages` always specifies base N. Only `slackpipe-refined` computes
+effective N=N+PP, once, before solving and executing. For N=8, PP=4 this means
+12 logical stages, three chunks per rank, with cyclic owners `s % PP`.
+Results/receipts retain `base_N` and `effective_N` in their topology/config.
+Both N and N+PP must satisfy the existing equal-chunk/layer-count checks.
+
+There is **no refinement heuristic**: no old boundaries are preserved and no
+stages are selected for splitting. The existing initializer receives the larger
+N and the stage count stays fixed throughout search. This is not OctoPipe stage
+dispersion. Budgets, seeds, thread counts, cost model, evaluator, plan schema,
+transport and SGD implementation are unchanged.
+
+The real-system driver already dispatches ordinary `slackpipe` to
+`joint-unrestricted-no-overlap`. That mapping is intentionally preserved, and
+`slackpipe-refined` uses the identical mapping with the larger `--N`.
+For direct canonical CLI experiments, use ordinary `--algorithm slackpipe`
+for **both** runs, changing only `--N 8` to `--N 12`. No new C++ algorithm exists.
+
+Calibration also uses the effective topology, with the same native calibration
+protocol and quality/retry checks. In particular, v1 stage-specific biases from
+N=8 are not silently copied to N=12. Consequently measured profiles can differ
+between topologies; the abstract-cost comparison below is the controlled
+fixed-cost comparison, not evidence of GPU speedup. Existing receipts/data are
+preserved in separate method namespaces.
+
+Direct comparison (run inside the existing OR-Tools environment, after creating
+`OUT`; repeat with N=12 and a different output prefix):
+
+```bash
+./slackpipe/build/artifact-or-audit/slackpipe_cli \
+  --algorithm slackpipe --B 8 --N 8 --J 4 --L 64 \
+  --ratio-num 2 --ratio-den 1 --communication 0 \
+  --time-limit-seconds 10 --num-workers 1 --random-seed 1 --require-optimal false \
+  --output-prefix OUT/slackpipe --emit-plan OUT/slackpipe.plan.json
+```
+
+Plot the actual evaluator CSV intervals on the same axes:
+
+```bash
+python slackpipe/scripts/plot_schedule_comparison.py \
+  --left-prefix OUT/slackpipe --right-prefix OUT/slackpipe_refined \
+  --right-label 'SlackPipe-refined (N=12)' --allow-stage-refinement --output-dir OUT/figures
+```
 
 ## Calibration and Acceptance
+
+Publication check (2026-09-30): the focused evaluation, receipt/resume, plotting,
+plan/cost-profile, quality-retry, topology, lifecycle and manifest regression set
+passed 191 tests in `slackpipe-dev`. No-OR and OR-enabled CTest each passed 4/4
+targets; the OR validation script also validated 14 canonical CLI results.
+Fresh and resumed five-method campaigns are covered with synthetic workers.
+Actual two-GPU FP32 tests executed exported OctoPipe (N=4), SlackPipe (N=4) and
+SlackPipe-refined (N=6) plans at PP=2/B=4/L=8: initial parameters, loss, every
+gradient and post-SGD parameters had maximum absolute differences of zero
+against ordinary Megatron, with runtime operation order matching each plan.
+This is not a full-size five-method GPU performance campaign; PP=4 performance
+and RMA were not rerun for publication. Raw local validation artifacts are in
+the ignored `slackpipe_experiments/five_method_publication_20260930/` directory.
 
 ```text
 env -> small numerical-equivalence gate -> target-model native smoke
@@ -266,7 +356,7 @@ off in this light trace. Existing standalone memory-diagnosis commands are in
 [the collection guide](slackpipe_collection.md); allocator experiments remain
 separate from primary comparisons.
 
-The campaign generates a three-panel PNG/PDF once all three traces exist. The
+The default campaign generates a five-panel PNG/PDF once all five traces exist. The
 first common complete-rank global iteration in cycle zero is selected
 deterministically, with candidates retained. No synthetic average, timestamp
 rescaling, or independent rank shifting is used. White gaps are outside labeled
@@ -274,7 +364,8 @@ envelopes, **not proven hardware idle**. For another recorded iteration:
 
 ```bash
 python -m tools.plot_schedule_trace \
-  --noninterleaved TRACE_1F1B --baseline TRACE_INTERLEAVED --slackpipe TRACE_SLACKPIPE \
+  --noninterleaved TRACE_1F1B --baseline TRACE_INTERLEAVED \
+  --octopipe TRACE_OCTOPIPE --slackpipe TRACE_SLACKPIPE --refined TRACE_REFINED \
   --iteration 9 --cycle 0 --output-png timeline.png --output-pdf timeline.pdf \
   --report figure_report.json
 ```
@@ -287,7 +378,7 @@ slackpipe_eval/FAMILY/SIZE/
   receipts/METHOD.STAGE[.runNNN].json
   calibration/calibrate-ATTEMPT/worker/{cost_profile,model_manifest,...}.json
   solver/solve-ATTEMPT/{slackpipe.plan.json,solver.*,*.binding.json}
-  1f1b/  interleaved/  slackpipe/  [optimized_interleaved/]
+  1f1b/  interleaved/  octopipe/  slackpipe/  slackpipe-refined/  [optimized_interleaved/]
     benchmark-ATTEMPT/runNNN/result.rankR.json
     benchmark-ATTEMPT/summary.json
   traces/trace-ATTEMPT/run000/RUN/METHOD/*.{torch,compact}.json
@@ -312,8 +403,11 @@ training using `python -m tools.slackpipe_eval_tables --output slackpipe_eval`.
 LaTeX groups homogeneous/hybrid configs and derives actual count, L, V, H, FFN and
 attention types. Benefits use synchronized continuous step means:
 `(T_1f1b-T_slackpipe)/T_1f1b`, `(T_1f1b-T_interleaved)/T_1f1b`,
-`(T_interleaved-T_slackpipe)/T_interleaved`, plus optional partition/scheduling
-contributions. Missing methods do not produce invented benefit values.
+`(T_interleaved-T_slackpipe)/T_interleaved`, and OctoPipe versus both native
+baselines. `slackpipe_vs_octopipe` is `(T_octopipe-T_slackpipe)/T_octopipe`.
+Optional partition/scheduling contributions remain available. Missing methods
+do not produce invented benefit values.
+`refinement_benefit` is `(T_slackpipe-T_refined)/T_slackpipe`.
 Report transport alongside these contributions: SlackPipe RMA versus native P2P
 is not a pure scheduling-only attribution.
 

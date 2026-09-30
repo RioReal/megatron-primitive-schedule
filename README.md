@@ -118,6 +118,20 @@ binaries. The image name can be replaced by your locally provisioned equivalent.
 
 ### Schemas
 
+The C++ solver also provides an [OctoPipe Algorithm-1-inspired fixed-stage baseline](docs/octopipe_algorithm1.md)
+via `--algorithm octopipe-algorithm1-fixed-stage`. It shares the SlackPipe evaluator,
+cost profiles, and plan emitter, requires no OR-Tools, and keeps backward unsplit.
+This is not full OctoPipe; see the document for controlled-comparison settings
+and the simulation-only limitation of noncyclic placement.
+
+The [real-system evaluation campaign](docs/slackpipe_real_system_eval.md) compares
+`1f1b`, `1f1b-interleave` (legacy name `interleaved`), `octopipe`, `slackpipe`, and `slackpipe-refined`
+by default. OctoPipe fixes cyclic placement and executes its validated exported
+plan through the shared plan runtime; it has separate method/solver provenance,
+benchmark summaries, and its own timeline panel. `slackpipe-refined` runs the
+identical SlackPipe solver at N+W logical stages instead of N. It adds no cut
+selection heuristic or solver logic; the five methods retain separate results.
+
 | Schema | Role |
 | --- | --- |
 | `slackpipe.plan.v1` | Dimensions, split, placement, ordered worker operations, solver metadata and abstract costs |
@@ -280,16 +294,22 @@ parameter counts are reported and checked against constructed models. Only
 Nemotron-H 8B preserves the official Base-8K architecture; other sizes and all
 LLaMA-style presets are explicitly research configurations, not released weights.
 
-Select `--schedule 1f1b`, `interleaved`, or `slackpipe` with
+Select `--schedule 1f1b`, `1f1b-interleave` (alias `interleaved`), `octopipe`,
+`slackpipe`, or `slackpipe-refined` with
 `python -m tools.run_slackpipe_eval full --model-config CONFIG --output OUTPUT`.
-Native 1F1B uses PP4/N4/VPP=None, while interleaved and SlackPipe default to
-PP4/N8/VPP2. Thus 1F1B versus SlackPipe is a system-level comparison; interleaved
+Native 1F1B uses PP4/N4/VPP=None; interleaved, OctoPipe and SlackPipe use
+PP4/N8/VPP2; SlackPipe-refined uses PP4/N12/VPP3 for base N=8.
+Thus 1F1B versus SlackPipe is a system-level comparison; interleaved
 versus SlackPipe is the better-controlled schedule comparison. Optional
 `optimized_interleaved` isolates partition effects.
 
 `tools/run_slackpipe_real_system_campaign.py` runs/resumes a family/size/schedule
-matrix, independently calibrates each model, rotates fresh-process repetitions,
-and exports raw samples, summary/LaTeX tables and three-panel trace figures.
+matrix with all five methods by default, independently calibrates each model,
+rotates fresh-process repetitions, and exports raw samples, summary/LaTeX tables
+and five-panel trace figures. Override the subset with `--schedules`, for example
+`--schedules 1f1b,1f1b-interleave,octopipe,slackpipe,slackpipe-refined`.
+Compatible calibration and prerequisites are shared within a campaign only after
+receipt validation; different effective topologies retain separate profiles.
 Defaults are 5 full-step warmups, 50 measured iterations, 3 repetitions; trace
 capture is a separate run with every profiler cycle preserved. Configuration,
 source, allocator, topology and timing provenance are receipt-gated. Large models

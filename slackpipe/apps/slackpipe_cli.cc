@@ -26,6 +26,7 @@
 #include "slackpipe/joint_solver.h"
 #include "slackpipe/one_f_one_b.h"
 #include "slackpipe/operation.h"
+#include "slackpipe/octopipe_tuner.h"
 #include "slackpipe/plan_export.h"
 #include "slackpipe/result_schema.h"
 #include "slackpipe/slackpipe_solver.h"
@@ -186,7 +187,11 @@ void PrintHelp() {
       << "                                  "
          "sequential-partition-then-schedule,\n"
       << "                                  alternating-partition-schedule, "
-         "slackpipe\n"
+         "slackpipe, octopipe-algorithm1-fixed-stage\n"
+      << "  --octopipe-max-iterations INT    deterministic tuning limit (0: unlimited)\n"
+      << "  --octopipe-candidates-per-iteration INT  F/B edit limit (default 64)\n"
+      << "  --octopipe-fixed-placement BOOL disable whole-stage swaps (default false)\n"
+      << "  --stage-to-worker CSV           OctoPipe initial placement (default cyclic)\n"
       << "  --method NAME                   optimize-bfs method: auto, "
          "enumerate, cpsat\n"
       << "  --fixed-order-partition-backend NAME\n"
@@ -556,6 +561,8 @@ int main(int argc, char **argv) {
   slackpipe::BfsSplitOptimizerOptions options;
   slackpipe::JointOptimizerOptions joint_options;
   slackpipe::SlackPipeOptions slackpipe_options;
+  slackpipe::OctoPipeOptions octopipe_options;
+  bool octopipe_flags_provided = false;
   slackpipe::ActivationAnalysisOptions activation_options;
   std::string activation_cap_derivation_hash;
   std::string activation_cap_enforcement_request;
@@ -592,6 +599,18 @@ int main(int argc, char **argv) {
         instance.communication_ticks = std::stoll(ValueAfter(i, argc, argv));
       } else if (flag == "--split") {
         split = ParseSplit(ValueAfter(i, argc, argv));
+      } else if (flag == "--stage-to-worker") {
+        instance.stage_to_worker = ParseSplit(ValueAfter(i, argc, argv));
+        octopipe_flags_provided = true;
+      } else if (flag == "--octopipe-max-iterations") {
+        octopipe_options.max_iterations = std::stoll(ValueAfter(i, argc, argv));
+        octopipe_flags_provided = true;
+      } else if (flag == "--octopipe-candidates-per-iteration") {
+        octopipe_options.candidates_per_iteration = std::stoll(ValueAfter(i, argc, argv));
+        octopipe_flags_provided = true;
+      } else if (flag == "--octopipe-fixed-placement") {
+        octopipe_options.tune_placement = !ParseBool(ValueAfter(i, argc, argv));
+        octopipe_flags_provided = true;
       } else if (flag == "--fixed-partition-source") {
         fixed_partition_source = ValueAfter(i, argc, argv);
       } else if (flag == "--output-prefix") {
@@ -806,6 +825,9 @@ int main(int argc, char **argv) {
     if (output_prefix.empty()) output_prefix = "slackpipe";
     const std::string requested_algorithm = algorithm;
     algorithm = slackpipe::CanonicalizeEvaluationMethodName(algorithm);
+    if (octopipe_flags_provided && algorithm != "octopipe-algorithm1-fixed-stage") {
+      throw slackpipe::Error("OctoPipe flags require --algorithm octopipe-algorithm1-fixed-stage");
+    }
     if (!fixed_order_partition_backend_provided) {
       fixed_order_partition_backend = method;
     }
@@ -1214,6 +1236,74 @@ int main(int argc, char **argv) {
       throw slackpipe::Error("unknown fixed partition source: " +
                              fixed_partition_source);
     };
+
+    if (algorithm == "octopipe-algorithm1-fixed-stage") {
+      if (!joint_options.fifo_ordering || activation_options.enforce_activation_cap ||
+          slackpipe_options.pressure_pruning.enabled ||
+          slackpipe_options.worker_balance_tolerance_percent >= 0 ||
+          slackpipe_options.worker_balance_tolerance_layers ||
+          !fixed_partition_source.empty() ||
+          (bfs_method_provided && slackpipe_options.bfs_method != "uniform") ||
+          incumbent_method_provided) {
+        throw slackpipe::Error("OctoPipe requires FIFO and does not support activation caps, "
+                               "pressure/worker-balance pruning, or --fixed-partition-source; "
+                               "use --split for an initial partition and --bfs-method uniform");
+      }
+      if (split.empty()) split = slackpipe::UniformSplit(instance);
+      octopipe_options.time_limit_seconds = options.time_limit_seconds;
+      if (options.log_search_progress || search_stats_enabled) {
+        search_stats.worker_partitions_enabled = octopipe_options.tune_placement;
+        search_stats.worker_partitions_reason = "OctoPipe whole-stage swaps; disabled by --octopipe-fixed-placement";
+        octopipe_options.progress = [&](const slackpipe::OctoPipeIteration& log,
+                                       const slackpipe::OctoPipeState&) {
+          search_stats.candidate_schedules_extracted += log.candidates;
+          search_stats.candidate_schedules_deterministically_evaluated += log.candidates;
+          search_stats.candidate_schedules_accepted += log.valid_candidates;
+          search_stats.candidate_schedules_rejected += log.candidates - log.valid_candidates;
+          if (!options.log_search_progress) return;
+          std::cerr << "OCTOPIPE iter=" << log.iteration << " elapsed=" << log.elapsed_seconds
+                    << " makespan=" << log.input_makespan << " delta_b=" << log.metrics.delta_b
+                    << " boundary_bubble=" << log.metrics.boundary_sum
+                    << " residual_bubble=" << log.metrics.residual_sum
+                    << " t_layer=" << log.t_layer << " phase=" << slackpipe::ToString(log.phase)
+                    << " candidates=" << log.candidates << " valid=" << log.valid_candidates
+                    << " accepted=" << log.accepted << " best=" << log.best_makespan << "\n";
+        };
+      }
+      const auto result = slackpipe::TuneOctoPipeAlgorithm1(
+          instance, split, slackpipe::BreadthFirstOrders(instance), octopipe_options);
+      instance = result.best.instance;
+      const auto& schedule = result.best.schedule;
+      slackpipe::CanonicalSemantics semantics;
+      semantics.canonical_method = algorithm;
+      semantics.actual_solver_path = "octopipe_algorithm1_fixed_stage_common_evaluator";
+      semantics.partition_decision = "local_contiguous_boundary_moves";
+      semantics.schedule_decision = "local_fb_only";
+      semantics.partition_optimized = true;
+      semantics.schedule_optimized = true;
+      semantics.cp_sat_launched = false;
+      semantics.cp_sat_models_solved = 0;
+      auto canonical = slackpipe::BuildCanonicalResultMetadata(
+          instance, request_context(requested_algorithm, options.time_limit_seconds), semantics,
+          slackpipe::OutcomeFromSchedule(schedule, "FEASIBLE", Since(cli_started)),
+          schedule.split, schedule.orders);
+      const auto validation = validate_canonical(schedule, canonical);
+      if (!validation.passed) return invalid_result_exit(validation);
+      slackpipe::WriteTextFile(output_prefix + ".json", slackpipe::ToJson(
+          instance, schedule, canonical, search_stats_enabled ? &search_stats : nullptr));
+      slackpipe::WriteTextFile(output_prefix + ".csv", slackpipe::ToCsv(instance, schedule));
+      slackpipe::WriteTextFile(output_prefix + ".orders.txt", slackpipe::ToOrdersText(instance, schedule.orders));
+      slackpipe::WriteTextFile(output_prefix + ".svg", slackpipe::ToSvg(instance, schedule));
+      emit_plan_after_predecessor_validation(schedule,
+          slackpipe::ExtractMachinePredecessors(instance, schedule.orders), "FEASIBLE", true);
+      dump_interleavings(schedule, {"FEASIBLE", schedule.makespan, std::nullopt});
+      std::cout << "algorithm=" << algorithm << " initial_N=" << instance.stages
+                << " final_N=" << schedule.split.size() << " initial_makespan=" << result.initial_makespan
+                << " makespan=" << schedule.makespan << " iterations=" << result.iterations
+                << " tuning_seconds=" << result.tuning_seconds << "\n";
+      finish_search_stats();
+      return finish(0);
+    }
 
     if (IsDeterministicUniformFixedOrderMethod(algorithm)) {
       if (!split.empty() && split != slackpipe::UniformSplit(instance)) {

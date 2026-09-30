@@ -11,7 +11,7 @@ import pytest
 from tools import run_slackpipe_real_system_campaign as campaign
 from tools.run_slackpipe_eval import Experiment, argument_parser
 from tools.run_slackpipe_nemotron_h8b_pp4 import digest
-from tools.slackpipe_eval_config import fingerprint, parameter_breakdown
+from tools.slackpipe_eval_config import COMPARISON_SCHEDULES, fingerprint, parameter_breakdown
 from tools.slackpipe_eval_receipts import (
     EMPTY_DIFF,
     LEGACY_COMMIT,
@@ -58,7 +58,7 @@ def synthetic(monkeypatch):
             (directory / "correctness.xml").write_text("<testsuite><testcase/></testsuite>")
         elif name == "solve":
             a = self.args
-            n, b, pp = a.logical_stages, a.microbatches, a.pp
+            n, b, pp = self.topology["num_stages"], a.microbatches, a.pp
             cuts = [self.model["num_layers"] * s // n for s in range(n + 1)]
             ops = [[] for _ in range(pp)]
             for mb in range(b):
@@ -349,7 +349,76 @@ def test_legacy_source_fix_boundary(monkeypatch):
     )
 
 
-def test_failed_reprofiling_prevents_campaign_solver(tmp_path, synthetic, monkeypatch):
+def test_octopipe_distinct_solver_shared_calibration(tmp_path, synthetic, monkeypatch):
+    commands = []
+    original = Experiment._execute
+
+    def record(self, command, directory, name):
+        commands.append((self.args.schedule, name, command))
+        return original(self, command, directory, name)
+
+    monkeypatch.setattr(Experiment, "_execute", record)
+    slack = execute(tmp_path, "solve", schedule="slackpipe").completed["solve"]
+    octo = execute(tmp_path, "solve", schedule="octopipe").completed["solve"]
+    assert octo["context"]["solver_algorithm"] == "octopipe-algorithm1-fixed-stage"
+    assert octo["context"]["octopipe_fixed_placement"] is True
+    assert slack["plan"] != octo["plan"]
+    assert slack["context"]["parents"]["calibrate"] == octo["context"]["parents"]["calibrate"]
+    assert synthetic["octopipe.calibrate"] == 0
+    command = next(c for method, name, c in commands if method == "octopipe" and name == "solve")
+    assert command[command.index("--algorithm") + 1] == "octopipe-algorithm1-fixed-stage"
+    assert command[command.index("--octopipe-fixed-placement") + 1] == "true"
+    assert Experiment(args_for(tmp_path, schedule="octopipe")).dependencies("smoke") == ("solve",)
+    before = synthetic.copy()
+    execute(tmp_path, "solve", schedule="octopipe")
+    assert before == synthetic
+
+
+def test_interleave_alias_keeps_receipt_namespace(tmp_path, synthetic):
+    first = execute(tmp_path, "benchmark", schedule="interleaved")
+    before = synthetic.copy()
+    alias = execute(tmp_path, "benchmark", schedule="1f1b-interleave")
+    assert alias.completed["benchmark"]["directory"] == first.completed["benchmark"]["directory"]
+    assert before == synthetic
+
+
+def test_refined_distinct_receipts_and_effective_n(tmp_path, synthetic, monkeypatch):
+    commands = []
+    original = Experiment._execute
+
+    def record(self, command, directory, name):
+        if name == "solve":
+            commands.append(command)
+        return original(self, command, directory, name)
+
+    monkeypatch.setattr(Experiment, "_execute", record)
+    base = execute(tmp_path, "benchmark")
+    refined = execute(tmp_path, "benchmark", schedule="slackpipe-refined")
+    assert base.topology["num_stages"] == 8
+    assert refined.topology["num_stages"] == 12
+    assert refined.args.logical_stages == 8
+    assert base.completed["calibrate"]["directory"] != refined.completed["calibrate"]["directory"]
+    assert base.completed["solve"]["plan"] != refined.completed["solve"]["plan"]
+    for cmd, n in zip(commands, (8, 12)):
+        assert cmd[cmd.index("--algorithm") + 1] == "joint-unrestricted-no-overlap"
+        assert cmd[cmd.index("--N") + 1] == n
+    for key in ("solver_seconds", "solver_workers", "seed", "ratio", "solver_algorithm"):
+        assert base.completed["solve"]["context"][key] == refined.completed["solve"]["context"][key]
+    from megatron.core.pipeline_parallel.slackpipe.plan import load_slackpipe_plan
+
+    plan = load_slackpipe_plan(
+        tmp_path / refined.completed["solve"]["plan"], pipeline_model_parallel_size=4
+    )
+    assert plan.num_stages == 12
+    assert sum(plan.layer_split) == refined.model["num_layers"]
+    assert plan.stage_to_worker == tuple(s % 4 for s in range(12))
+    before = synthetic.copy()
+    execute(tmp_path, "benchmark", schedule="slackpipe-refined")
+    assert before == synthetic
+
+
+@pytest.mark.parametrize("schedule", ["slackpipe", "octopipe", "slackpipe-refined"])
+def test_failed_reprofiling_prevents_campaign_solver(tmp_path, synthetic, monkeypatch, schedule):
     from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
         ProfilingQualityError,
         publish_profile,
@@ -368,7 +437,7 @@ def test_failed_reprofiling_prevents_campaign_solver(tmp_path, synthetic, monkey
         )
 
     monkeypatch.setattr(Experiment, "_worker", worker)
-    experiment = Experiment(args_for(tmp_path, "solve"))
+    experiment = Experiment(args_for(tmp_path, "solve", schedule=schedule))
     with (
         pytest.warns(RuntimeWarning),
         pytest.raises(ProfilingQualityError, match="retry exhausted"),
@@ -416,7 +485,7 @@ def test_real_campaign_partial_resume_three_repetitions(tmp_path, synthetic, mon
     root = tmp_path / "llama/8b"
     upstream = execute(root, "solve", repetitions=3)
     # Complete exactly one campaign repetition, then resume the real campaign entry point.
-    for schedule in ("1f1b", "interleaved", "slackpipe"):
+    for schedule in COMPARISON_SCHEDULES:
         execute(root, "benchmark", schedule=schedule, run_index=0)
     before = synthetic.copy()
     monkeypatch.setattr(
@@ -438,12 +507,12 @@ def test_real_campaign_partial_resume_three_repetitions(tmp_path, synthetic, mon
     campaign.main()
     assert synthetic["solve"] == before["solve"]
     assert synthetic["slackpipe.calibrate"] == before["slackpipe.calibrate"]
-    for schedule in ("1f1b", "interleaved", "slackpipe"):
+    for schedule in COMPARISON_SCHEDULES:
         assert synthetic[(schedule, "benchmark", 0)] == before[(schedule, "benchmark", 0)]
         assert synthetic[(schedule, "benchmark", 1)] == 1
         assert synthetic[(schedule, "benchmark", 2)] == 1
     summaries = json.loads((tmp_path / "experiment_summary.json").read_text())
-    assert [s["num_repetitions"] for s in summaries if s["stage"] == "benchmark"] == [3, 3, 3]
+    assert [s["num_repetitions"] for s in summaries if s["stage"] == "benchmark"] == [3] * 5
     before = synthetic.copy()
     campaign.main()
     assert synthetic == before
@@ -519,6 +588,113 @@ def test_legacy_across_receipt_only_source_fix(tmp_path, synthetic, monkeypatch)
     unknown = dict(old["env"], context=dict(old["env"]["context"], unrecognized_setting=True))
     state, reason, _ = assess_receipt(unknown, migrated._context("env", {}), tmp_path, {})
     assert state == "legacy-incompatible" and "unknown/missing legacy context fields" in reason
+
+
+def test_fresh_campaign_shares_only_compatible_upstream_work(tmp_path, synthetic, monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv", ["campaign", "--families", "llama", "--sizes", "8b", "--output", str(tmp_path)]
+    )
+    campaign.main()
+    assert synthetic["correctness"] == 3  # Physical, base VPP, and refined VPP topologies.
+    assert sum(synthetic[f"{s}.calibrate"] for s in COMPARISON_SCHEDULES) == 2
+    assert sum(synthetic[f"{s}.smoke"] for s in COMPARISON_SCHEDULES) == 7
+    assert synthetic["solve"] == 3  # Never share different algorithms or effective N.
+    for schedule in COMPARISON_SCHEDULES:
+        assert synthetic[f"{schedule}.benchmark"] == 3
+        assert synthetic[f"{schedule}.trace"] == 1
+    root = tmp_path / "llama/8b/receipts"
+    calibration = {
+        s: json.loads((root / f"{s}.calibrate.json").read_text())
+        for s in ("octopipe", "slackpipe", "slackpipe-refined")
+    }
+    assert calibration["octopipe"]["profile"] == calibration["slackpipe"]["profile"]
+    assert calibration["slackpipe-refined"]["profile"] != calibration["slackpipe"]["profile"]
+    before = synthetic.copy()
+    with pytest.raises(RuntimeError, match="Existing/stale receipt"):
+        campaign.main()  # Fresh sharing is not implicit resume of a previous campaign.
+    assert synthetic == before
+
+
+def test_campaign_sharing_checks_artifact_integrity(tmp_path, synthetic):
+    first = execute(tmp_path, "solve", schedule="octopipe")
+    shared = [first.receipt_path(s) for s in first.completed]
+    calibration = first.completed["calibrate"]
+    (tmp_path / calibration["profile"]).write_text("corrupted")
+    second = Experiment(args_for(tmp_path, resume=False), shared_receipts=shared)
+    second.execute()
+    assert synthetic["slackpipe.calibrate"] == 1
+    assert second.completed["calibrate"]["directory"] != calibration["directory"]
+
+
+def test_campaign_sharing_does_not_adopt_unlisted_receipts(tmp_path, synthetic):
+    first = execute(tmp_path, "solve", schedule="octopipe")
+    second = Experiment(
+        args_for(tmp_path, resume=False), shared_receipts=[first.receipt_path("env")]
+    )
+    second.execute()
+    assert synthetic["correctness"] == 2
+    assert synthetic["slackpipe.calibrate"] == 1
+    assert second.completed["env"]["directory"] == first.completed["env"]["directory"]
+
+
+@pytest.mark.parametrize("duplicate", ["family", "size", "symlink", "model", "output", "alias"])
+def test_campaign_rejects_duplicates_before_launch(tmp_path, synthetic, monkeypatch, duplicate):
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    model = json.loads(CONFIG.read_text())
+    write_json(configs / "llama_8b.json", model)
+    families, sizes, schedules = "llama", "8b", "slackpipe"
+    if duplicate == "family":
+        families = "llama, llama"
+    elif duplicate == "size":
+        sizes = "8b,8b"
+    elif duplicate in ("symlink", "model", "output"):
+        sizes = "8b,copy"
+        other = configs / "llama_copy.json"
+        if duplicate == "symlink":
+            other.symlink_to(configs / "llama_8b.json")
+        else:
+            if duplicate == "output":
+                model["name"] = "different-model-same-output"
+            write_json(other, model)
+    else:
+        schedules = "interleaved,1f1b-interleave"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "campaign",
+            "--configs",
+            str(configs),
+            "--output",
+            str(tmp_path / "results"),
+            "--families",
+            families,
+            "--sizes",
+            sizes,
+            "--schedules",
+            schedules,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        campaign.main()
+    assert exc.value.code == 2
+    assert not synthetic
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize(
+    "schedule,n", [("slackpipe", 8), ("slackpipe-refined", 12), ("interleaved", 8), ("octopipe", 8)]
+)
+def test_worker_effective_n_is_applied_once(tmp_path, monkeypatch, schedule, n):
+    exp = Experiment(args_for(tmp_path, schedule=schedule))
+    commands = []
+    monkeypatch.setattr(exp, "_execute", lambda cmd, *rest: commands.append(cmd))
+    exp._worker("calibrate", tmp_path / "calibration", schedule="interleaved")
+    exp._worker("smoke", tmp_path / "execution", schedule=schedule)
+    assert commands[0][commands[0].index("--logical-stages") + 1] == n
+    assert commands[1][commands[1].index("--logical-stages") + 1] == 8
+    assert Experiment(exp.args).topology["num_stages"] == n
 
 
 def test_v2_integrity_and_detailed_diagnostics(tmp_path, synthetic):

@@ -695,7 +695,7 @@ ActivationAnalysisResult AnalyzeActivationMemory(
       const OperationView forward_view = DecodeOperation(instance, forward_id);
       const OperationView backward_view =
           DecodeOperation(instance, backward_id);
-      const Index expected_worker = s % instance.workers;
+      const Index expected_worker = instance.WorkerForStage(s);
       if (forward.worker != backward.worker ||
           forward_view.worker != backward_view.worker ||
           forward.worker != expected_worker) {

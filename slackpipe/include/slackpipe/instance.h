@@ -29,8 +29,12 @@ struct Instance {
   std::string cost_profile_hash;
   std::string model_manifest_hash;
   std::string cost_profile_units = "microseconds";
+  // Empty preserves the existing cyclic placement. Explicit maps are used by
+  // the fixed-stage OctoPipe tuner and the common evaluator, not CP-SAT search.
+  std::vector<Index> stage_to_worker;
 
   void Validate() const;
+  [[nodiscard]] Index WorkerForStage(Index stage) const;
   [[nodiscard]] bool HasCostProfile() const;
   [[nodiscard]] bool HasAffineCostProfile() const;
   [[nodiscard]] bool HasRangeCostProfile() const;

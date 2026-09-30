@@ -11,7 +11,21 @@ import json
 from pathlib import Path
 
 SCHEMA = "slackpipe.eval_model.v1"
-SCHEDULES = ("1f1b", "interleaved", "slackpipe", "optimized_interleaved")
+COMPARISON_SCHEDULES = ("1f1b", "interleaved", "octopipe", "slackpipe", "slackpipe-refined")
+SCHEDULES = (*COMPARISON_SCHEDULES, "optimized_interleaved")
+PLAN_SCHEDULES = ("octopipe", "slackpipe", "slackpipe-refined", "optimized_interleaved")
+
+
+def canonical_schedule(schedule: str) -> str:
+    """Keep existing receipt namespaces while accepting the comparison label."""
+    return "interleaved" if schedule == "1f1b-interleave" else schedule
+
+
+def execution_mode(schedule: str) -> str:
+    """Both optimizer plans use the same executor, not the native 1F1B order."""
+    if schedule in ("octopipe", "slackpipe", "slackpipe-refined"):
+        return "slackpipe"
+    return "partition" if schedule == "optimized_interleaved" else "baseline"
 
 
 def fingerprint(value: dict) -> str:
@@ -150,11 +164,16 @@ def parameter_breakdown(model: dict) -> dict:
 
 
 def schedule_topology(schedule: str, pp: int, stages: int | None, microbatches: int) -> dict:
+    schedule = canonical_schedule(schedule)
     if schedule not in SCHEDULES or pp not in (1, 2, 4) or microbatches < 1:
         raise ValueError("Unsupported schedule, PP or B")
     stages = stages if stages is not None else (pp if schedule == "1f1b" else 2 * pp)
     if stages < pp or stages % pp:
         raise ValueError("Cyclic placement requires N % PP == 0")
+    refinement = {}
+    if schedule == "slackpipe-refined":
+        refinement = dict(base_N=stages, effective_N=stages + pp)
+        stages += pp
     if schedule == "1f1b" and stages != pp:
         raise ValueError("Native 1F1B requires N=PP and VPP=None")
     if schedule in ("interleaved", "optimized_interleaved") and (stages == pp or pp == 1):
@@ -169,6 +188,7 @@ def schedule_topology(schedule: str, pp: int, stages: int | None, microbatches: 
         tp=1,
         dp=1,
         cp=1,
+        **refinement,
     )
 
 

@@ -2,6 +2,7 @@
 
 import copy
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,66 @@ from tools.slackpipe_eval_worker import validate_profile
 from tools.slackpipe_nemotron_worker import construction_plan, uniform_cuts
 
 CONFIGS = Path(__file__).resolve().parents[3] / "configs/slackpipe_eval"
+
+
+def test_octopipe_cli_exports_executable_plan(tmp_path):
+    from megatron.core.pipeline_parallel.slackpipe.plan import (
+        load_slackpipe_plan,
+        validate_cyclic_placement,
+    )
+
+    cli = CONFIGS.parents[1] / "slackpipe/build/no-or/slackpipe_cli"
+    if not cli.is_file():
+        pytest.skip("Build slackpipe/build/no-or/slackpipe_cli to test the real exporter")
+    plan_path = tmp_path / "octopipe.plan.json"
+    subprocess.run(
+        [
+            str(cli),
+            "--algorithm",
+            "octopipe-algorithm1-fixed-stage",
+            "--B",
+            "4",
+            "--N",
+            "4",
+            "--J",
+            "2",
+            "--L",
+            "8",
+            "--ratio-num",
+            "2",
+            "--ratio-den",
+            "1",
+            "--communication",
+            "0",
+            "--octopipe-fixed-placement",
+            "true",
+            "--time-limit-seconds",
+            "0.1",
+            "--output-prefix",
+            str(tmp_path / "solver"),
+            "--emit-plan",
+            str(plan_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    subprocess.run(
+        [str(cli), "validate-result", "--input", str(tmp_path / "solver.json")],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    plan = load_slackpipe_plan(plan_path, pipeline_model_parallel_size=2)
+    validate_cyclic_placement(plan)
+    assert (plan.num_microbatches, plan.num_stages, plan.num_layers) == (4, 4, 8)
+    operations = [op for rank in range(2) for op in plan.worker_operations(rank)]
+    assert len(operations) == 32
+    assert {(op.kind, op.microbatch, op.stage) for op in operations} == {
+        (kind, b, s) for kind in ("F", "B") for b in range(4) for s in range(4)
+    }
 
 
 def tiny_model(family):
@@ -90,6 +151,24 @@ def test_generic_topology_and_coverage(b, n):
 
 
 def test_schedule_routing():
+    from tools.slackpipe_eval_config import COMPARISON_SCHEDULES, execution_mode
+
+    assert COMPARISON_SCHEDULES == (
+        "1f1b",
+        "interleaved",
+        "octopipe",
+        "slackpipe",
+        "slackpipe-refined",
+    )
+    assert execution_mode("octopipe") == "slackpipe"
+    assert execution_mode("slackpipe-refined") == "slackpipe"
+    refined = schedule_topology("slackpipe-refined", 4, 8, 8)
+    assert (refined["base_N"], refined["num_stages"], refined["vpp"]) == (8, 12, 3)
+    with pytest.raises(ValueError, match="N % PP"):
+        schedule_topology("slackpipe-refined", 4, 7, 8)
+    assert schedule_topology("1f1b-interleave", 4, 8, 8) == schedule_topology(
+        "interleaved", 4, 8, 8
+    )
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
     assert (
@@ -234,7 +313,7 @@ def test_experiment_resume_never_launches_matching_stage(tmp_path, monkeypatch):
         exp.ensure("env")
 
 
-def test_three_panel_plot_and_capture_policy(tmp_path):
+def test_comparison_panels_and_capture_policy(tmp_path):
     from megatron.core.pipeline_parallel.slackpipe.figure_trace import write_compact_trace
     from tests.unit_tests.pipeline_parallel.test_slackpipe_figure_trace import compact
     from tools.plot_schedule_trace import load_panel, render
@@ -282,6 +361,21 @@ def test_three_panel_plot_and_capture_policy(tmp_path):
     report = render(inter, slack, noninterleaved=native, **options)
     assert report["noninterleaved"]["iteration"] == 5
     assert (tmp_path / "plot.pdf").stat().st_size > 0
+    octo = copy.deepcopy(slack)
+    octo["mode"] = "octopipe"
+    report = render(inter, slack, noninterleaved=native, octopipe=octo, **options)
+    assert report["octopipe"]["iteration"] == report["slackpipe"]["iteration"] == 5
+    refined = copy.deepcopy(slack)
+    refined["mode"] = "slackpipe-refined"
+    refined["config"].update(num_stages=6, base_N=4, effective_N=6)
+    report = render(inter, slack, noninterleaved=native, octopipe=octo, refined=refined, **options)
+    assert report["refined"]["config"]["num_stages"] == 6
+    refined["config"]["num_stages"] = 4
+    with pytest.raises(ValueError, match="N\\+W"):
+        render(inter, slack, refined=refined, **options)
+    octo["collection"]["cycle"] = 1
+    with pytest.raises(ValueError, match="capture"):
+        render(inter, slack, noninterleaved=native, octopipe=octo, **options)
     native["collection"]["cycle"] = 1
     with pytest.raises(ValueError, match="capture"):
         render(inter, slack, noninterleaved=native, **options)
@@ -298,6 +392,9 @@ def test_tables_are_from_configs(tmp_path):
     assert benefits({"1f1b": 10, "interleaved": 8, "slackpipe": 6}) == dict(
         slackpipe_vs_1f1b=0.4, interleaving_benefit=0.2, slackpipe_vs_interleaved=0.25
     )
+    assert benefits({"1f1b": 10, "interleaved": 8, "octopipe": 7, "slackpipe": 6})[
+        "slackpipe_vs_octopipe"
+    ] == pytest.approx(1 / 7)
 
 
 def test_benchmark_summary_raw_agreement():

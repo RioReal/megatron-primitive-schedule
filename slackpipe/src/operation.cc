@@ -74,7 +74,7 @@ Index StageForOperationPosition(const Instance& instance, Index chain_index) {
 }
 
 Index WorkerForOperationPosition(const Instance& instance, Index chain_index) {
-  return StageForOperationPosition(instance, chain_index) % instance.workers;
+  return instance.WorkerForStage(StageForOperationPosition(instance, chain_index));
 }
 
 OperationView DecodeOperation(const Instance& instance, OperationId id) {

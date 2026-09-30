@@ -43,7 +43,7 @@ struct SummaryValue {
                                     -1);
   std::vector<Index> next_pos(static_cast<std::size_t>(instance.workers), 0);
   for (Index stage = 0; stage < instance.stages; ++stage) {
-    const Index worker = stage % instance.workers;
+    const Index worker = instance.WorkerForStage(stage);
     stage_position[static_cast<std::size_t>(stage)] =
         next_pos[static_cast<std::size_t>(worker)]++;
   }

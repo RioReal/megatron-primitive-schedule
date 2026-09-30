@@ -516,7 +516,7 @@ std::vector<StageWorkerMappingEntry> BuildStageMapping(
   std::vector<StageWorkerMappingEntry> mapping;
   mapping.reserve(static_cast<std::size_t>(instance.stages));
   for (Index s = 0; s < instance.stages; ++s) {
-    mapping.push_back(StageWorkerMappingEntry{s, s % instance.workers});
+    mapping.push_back(StageWorkerMappingEntry{s, instance.WorkerForStage(s)});
   }
   return mapping;
 }
@@ -826,6 +826,12 @@ CanonicalResultMetadata BuildCanonicalResultMetadata(
   metadata.total_layers = instance.total_layers;
   metadata.min_layers = instance.min_layers;
   metadata.stage_to_worker_mapping = BuildStageMapping(instance);
+  for (Index s = 0; s < instance.stages; ++s) {
+    if (instance.WorkerForStage(s) != s % instance.workers) {
+      metadata.mapping_type = "explicit_fixed_stage";
+      break;
+    }
+  }
   metadata.forward_cost_ratio_numerator = instance.backward_ratio_den;
   metadata.forward_cost_ratio_denominator = 1;
   metadata.backward_cost_ratio_numerator = instance.backward_ratio_num;

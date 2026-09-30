@@ -1,0 +1,12 @@
+{
+  "schema_version": "slackpipe.cost_profile.v2",
+  "model_manifest_hash": "synthetic-eight-layer-example-not-measured",
+  "cost_profile_hash": "octopipe-algorithm1-synthetic-example-v1",
+  "prefix_forward_us": [0, 1, 10, 12, 15, 19, 24, 30, 37],
+  "prefix_backward_us": [0, 2, 20, 24, 30, 38, 48, 60, 74],
+  "stage_role_bias_us": {
+    "first": {"forward": 2, "backward": 5},
+    "middle": {"forward": 3, "backward": 6},
+    "last": {"forward": 4, "backward": 7}
+  }
+}

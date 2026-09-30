@@ -59,6 +59,10 @@ def benefits(times: dict) -> dict:
         "slackpipe_vs_1f1b": ("1f1b", "slackpipe"),
         "interleaving_benefit": ("1f1b", "interleaved"),
         "slackpipe_vs_interleaved": ("interleaved", "slackpipe"),
+        "octopipe_vs_1f1b": ("1f1b", "octopipe"),
+        "octopipe_vs_interleaved": ("interleaved", "octopipe"),
+        "slackpipe_vs_octopipe": ("octopipe", "slackpipe"),
+        "refinement_benefit": ("slackpipe", "slackpipe-refined"),
         "partition_contribution": ("interleaved", "optimized_interleaved"),
         "scheduling_contribution": ("optimized_interleaved", "slackpipe"),
     }

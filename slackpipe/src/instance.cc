@@ -42,10 +42,25 @@ Tick CheckedDivExact(Tick numerator, Tick denominator, const char* context) {
   return numerator / denominator;
 }
 
+Index Instance::WorkerForStage(Index stage) const {
+  if (stage < 0 || stage >= stages || workers <= 0) {
+    throw Error("invalid stage or worker count in placement lookup");
+  }
+  return stage_to_worker.empty() ? stage % workers : stage_to_worker.at(stage);
+}
+
 void Instance::Validate() const {
   if (microbatches <= 0) throw Error("microbatches must be positive");
   if (stages <= 0) throw Error("stages must be positive");
   if (workers <= 0) throw Error("workers must be positive");
+  if (!stage_to_worker.empty()) {
+    if (stage_to_worker.size() != static_cast<std::size_t>(stages)) {
+      throw Error("stage_to_worker must have N entries");
+    }
+    for (Index worker : stage_to_worker) {
+      if (worker < 0 || worker >= workers) throw Error("invalid placement worker");
+    }
+  }
   if (total_layers <= 0) throw Error("total_layers must be positive");
   if (min_layers <= 0) throw Error("min_layers must be positive");
   if (backward_ratio_num <= 0 || backward_ratio_den <= 0) {

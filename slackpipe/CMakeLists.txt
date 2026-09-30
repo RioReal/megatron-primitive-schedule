@@ -57,6 +57,7 @@ add_library(slackpipe_core
   src/joint_solver.cc
   src/one_f_one_b.cc
   src/operation.cc
+  src/octopipe_tuner.cc
   src/workload_bound.cc
   src/plan_export.cc
   src/pressure_pruning.cc
@@ -181,6 +182,9 @@ target_link_libraries(slackpipe_cli PRIVATE slackpipe_core)
 add_executable(slackpipe_benchmark apps/slackpipe_benchmark.cc)
 target_link_libraries(slackpipe_benchmark PRIVATE slackpipe_core)
 
+add_executable(octopipe_phase_diagnostic apps/octopipe_phase_diagnostic.cc)
+target_link_libraries(octopipe_phase_diagnostic PRIVATE slackpipe_core)
+
 if(SLACKPIPE_BUILD_TESTS)
   enable_testing()
   find_package(GTest QUIET)
@@ -188,6 +192,8 @@ if(SLACKPIPE_BUILD_TESTS)
   add_executable(slackpipe_core_tests
     tests/benchmark_tests.cc
     tests/core_tests.cc
+    tests/octopipe_tests.cc
+    tests/octopipe_diagnostic_tests.cc
     tests/workload_bound_tests.cc
   )
   if(GTest_FOUND)

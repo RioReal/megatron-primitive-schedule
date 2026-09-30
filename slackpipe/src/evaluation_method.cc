@@ -327,7 +327,18 @@ const std::vector<EvaluationMethodDefinition>& EvaluationMethodRegistry() {
           "unrestricted CP-SAT NoOverlap order per worker; no predecessor "
           "candidate restriction",
           "joint partition variables",
-          "canonical direct joint baseline"}};
+          "canonical direct joint baseline"},
+      EvaluationMethodDefinition{
+          "octopipe-algorithm1-fixed-stage", {},
+          "local_contiguous_boundary_moves", "local_fb_only",
+          {"B", "N", "W", "L", "data_dependencies", "fifo_dependencies", "communication_model"},
+          {"stage_layer_partition", "whole_stage_placement_unless_fixed", "worker_local_operation_order"},
+          true, true, false, true, true,
+          "delta_b > t_layer: partition; else boundary > residual: fixed-stage placement; else F/B schedule",
+          "tuning loop wall-clock budget and optional iteration bound; deterministic with iteration-only budget",
+          "common predecessor evaluator; bounded earlier F/B insertion; no W operations",
+          "uniform breadth-first or supplied initial split/placement; API accepts native initial orders",
+          "restricted OctoPipe Algorithm 1, arXiv:2509.23722v3; NOT full OctoPipe"}};
   return methods;
 }
 

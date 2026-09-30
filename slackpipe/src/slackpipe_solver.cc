@@ -136,7 +136,7 @@ std::vector<std::vector<Index>> StagesOnWorkers(const Instance& instance) {
   std::vector<std::vector<Index>> stages(
       static_cast<std::size_t>(instance.workers));
   for (Index s = 0; s < instance.stages; ++s) {
-    stages[static_cast<std::size_t>(s % instance.workers)].push_back(s);
+    stages[static_cast<std::size_t>(instance.WorkerForStage(s))].push_back(s);
   }
   return stages;
 }
@@ -147,7 +147,7 @@ std::vector<Tick> WorkerLayerTotals(const Instance& instance,
   ValidateSplit(instance, split);
   std::vector<Tick> totals(static_cast<std::size_t>(instance.workers), 0);
   for (Index s = 0; s < instance.stages; ++s) {
-    totals[static_cast<std::size_t>(s % instance.workers)] +=
+    totals[static_cast<std::size_t>(instance.WorkerForStage(s))] +=
         split[static_cast<std::size_t>(s)];
   }
   return totals;

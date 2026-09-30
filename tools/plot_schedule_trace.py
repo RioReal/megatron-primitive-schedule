@@ -165,6 +165,8 @@ def render(
     annotate_saved: bool,
     detail: bool = False,
     noninterleaved: dict | None = None,
+    octopipe: dict | None = None,
+    refined: dict | None = None,
 ) -> dict:
     import matplotlib
 
@@ -210,6 +212,53 @@ def render(
                 raise ValueError(f"Panels use different {k}")
     panels = [baseline, slackpipe]
     titles = ["Interleaved 1F1B", "SlackPipe"]
+    if refined is not None:
+        if refined["mode"] != "slackpipe-refined":
+            raise ValueError("Expected SlackPipe + Refine panel")
+        if any(refined["config"][k] != baseline["config"][k] for k in fields if k != "num_stages"):
+            raise ValueError("Refined model/data settings differ")
+        base_n, pp = baseline["config"]["num_stages"], baseline["config"]["pp"]
+        if (
+            refined["config"].get("base_N") != base_n
+            or refined["config"]["num_stages"] != base_n + pp
+            or refined["config"].get("effective_N") != base_n + pp
+        ):
+            raise ValueError("Refined panel must have explicit base N and effective N+W")
+        if refined["iteration"] != baseline["iteration"]:
+            raise ValueError("Refined panel must show the same global iteration")
+        for panel in (refined, slackpipe):
+            for k in ("profiler", "active_iterations", "cycle"):
+                if panel["collection"][k] != baseline["collection"][k]:
+                    raise ValueError(f"Refined capture policy differs: {k}")
+            for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
+                if (
+                    panel["collection"]["environment"][k]
+                    != baseline["collection"]["environment"][k]
+                ):
+                    raise ValueError(f"Refined environment differs: {k}")
+        panels.append(refined)
+        titles.append("SlackPipe + Refine")
+    if octopipe is not None:
+        if octopipe["mode"] != "octopipe":
+            raise ValueError("Expected OctoPipe panel")
+        if any(octopipe["config"][k] != baseline["config"][k] for k in fields):
+            raise ValueError("OctoPipe model/data settings differ")
+        if octopipe["iteration"] != baseline["iteration"]:
+            raise ValueError("OctoPipe must show the same global iteration")
+        if not octopipe["collection"] or not baseline["collection"]:
+            raise ValueError("OctoPipe comparison requires versioned capture provenance")
+        for panel in (octopipe, slackpipe):
+            for k in ("profiler", "active_iterations", "cycle"):
+                if panel["collection"][k] != baseline["collection"][k]:
+                    raise ValueError(f"Four-panel capture policy differs: {k}")
+            for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
+                if (
+                    panel["collection"]["environment"][k]
+                    != baseline["collection"]["environment"][k]
+                ):
+                    raise ValueError(f"Four-panel environment differs: {k}")
+        panels.insert(1, octopipe)
+        titles.insert(1, "OctoPipe (fixed-stage, cyclic)")
     if noninterleaved is not None:
         if noninterleaved["mode"] != "1f1b" or noninterleaved["iteration"] != baseline["iteration"]:
             raise ValueError("Expected native 1F1B at the same global iteration")
@@ -358,6 +407,8 @@ def render(
         schema_version="slackpipe.figure_report.v1",
         baseline=baseline,
         noninterleaved=noninterleaved,
+        octopipe=octopipe,
+        refined=refined,
         slackpipe=slackpipe,
         time_saved_ms=saved,
         plot_time_bounds_ms=[left_bound, right_bound],
@@ -375,6 +426,8 @@ def main():
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--slackpipe", type=Path, required=True)
     parser.add_argument("--noninterleaved", type=Path, help="Optional native 1F1B third panel")
+    parser.add_argument("--octopipe", type=Path, help="Optional fixed-stage OctoPipe panel")
+    parser.add_argument("--refined", type=Path, help="Optional SlackPipe + Stage Refinement panel")
     parser.add_argument("--output-png", type=Path, required=True)
     parser.add_argument("--output-pdf", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
@@ -399,6 +452,10 @@ def main():
         candidates = sorted(
             set(candidates) & available_iterations(args.noninterleaved, cycle=args.cycle)
         )
+    if args.octopipe:
+        candidates = sorted(set(candidates) & available_iterations(args.octopipe, cycle=args.cycle))
+    if args.refined:
+        candidates = sorted(set(candidates) & available_iterations(args.refined, cycle=args.cycle))
     if not candidates:
         parser.error("No common complete-rank global iteration")
     iteration = args.iteration if args.iteration is not None else candidates[0]
@@ -417,6 +474,10 @@ def main():
             if args.noninterleaved
             else None
         ),
+        octopipe=(
+            load_panel(args.octopipe, iteration, cycle=args.cycle) if args.octopipe else None
+        ),
+        refined=load_panel(args.refined, iteration, cycle=args.cycle) if args.refined else None,
     )
     report["selection"] = dict(
         iteration=iteration,

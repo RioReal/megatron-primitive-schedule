@@ -33,6 +33,7 @@ from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
 )
 from megatron.core.pipeline_parallel.slackpipe.schedule import shutdown_slackpipe_runtime
 from tools.slackpipe_eval_config import (
+    execution_mode,
     fingerprint,
     load_model,
     parameter_breakdown,
@@ -106,11 +107,7 @@ def run_worker(args) -> None:
         topology["vpp"],
         args.microbatches,
     )
-    args.mode = (
-        "slackpipe"
-        if args.schedule == "slackpipe"
-        else ("partition" if args.schedule == "optimized_interleaved" else "baseline")
-    )
+    args.mode = execution_mode(args.schedule)
     args.vocab_size, args.hidden_size = model["vocab_size"], model["hidden_size"]
     args.exact_parameter_count = parameter_breakdown(model)["exact_parameter_count"]
     args.tiny, args.verify_update = False, args.action == "smoke"

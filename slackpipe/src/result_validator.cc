@@ -101,7 +101,7 @@ StableOperationKey KeyForIdUnchecked(const Instance& instance, OperationId id) {
   key.phase = backward ? "B" : "F";
   key.stage = backward ? positions - 1 - key.operation_position
                        : key.operation_position;
-  key.worker = key.stage % instance.workers;
+  key.worker = instance.WorkerForStage(key.stage);
   return key;
 }
 
@@ -580,6 +580,21 @@ ResultValidationInput InputFromJson(const JsonValue& root) {
   input.instance.min_layers =
       FieldTick(source, "min_layers")
           .value_or(FieldTick(root, "min_layers").value_or(1));
+  if (const auto* mapping = source.Find("stage_to_worker_mapping")) {
+    if (mapping->type != JsonValue::Type::kArray ||
+        mapping->array_value.size() != static_cast<std::size_t>(input.instance.stages)) {
+      throw Error("invalid stage_to_worker_mapping");
+    }
+    input.instance.stage_to_worker.assign(input.instance.stages, -1);
+    for (const auto& entry : mapping->array_value) {
+      const Index stage = FieldTick(entry, "stage").value_or(-1);
+      if (stage < 0 || stage >= input.instance.stages ||
+          input.instance.stage_to_worker[stage] != -1) {
+        throw Error("invalid or duplicate placement stage");
+      }
+      input.instance.stage_to_worker[stage] = FieldTick(entry, "worker").value_or(-1);
+    }
+  }
 
   const Tick forward_num =
       FieldTick(source, "forward_cost_ratio_numerator")
@@ -1280,7 +1295,7 @@ ResultValidationResult ValidateResult(const ResultValidationInput& input) {
             OperationNameUnchecked(input.instance, record.id));
         return Fail(std::move(result), started, "operation_worker_mismatch",
                     "serialization",
-                    "serialized worker does not match cyclic stage mapping");
+                    "serialized worker does not match stage mapping");
       }
       const Tick expected_duration =
           durations[static_cast<std::size_t>(record.id.value)];
