@@ -12,6 +12,10 @@ from typing import Iterable, Mapping, Sequence
 import numpy
 
 from megatron.core.pipeline_parallel.slackpipe.manifest import canonical_json
+from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+    QualityThresholds,
+    isolate_timing_spikes,
+)
 
 SLACKPIPE_COST_PROFILE_SCHEMA_VERSION = "slackpipe.cost_profile.v1"
 SLACKPIPE_COST_PROFILE_SCHEMA_VERSION_V2 = "slackpipe.cost_profile.v2"
@@ -69,6 +73,7 @@ def aggregate_stage_costs(
     num_microbatches: int,
     iteration_start: int,
     iteration_end: int,
+    quality_thresholds: QualityThresholds = QualityThresholds(),
 ) -> list[dict[str, object]]:
     """Aggregate synchronized compute events into per-stage median costs."""
 
@@ -78,7 +83,7 @@ def aggregate_stage_costs(
     if not iterations:
         raise ValueError("iteration range must be non-empty")
     num_stages = len(layer_split)
-    totals = defaultdict(lambda: {"forward": 0.0, "backward": 0.0})
+    samples = defaultdict(list)
     provenance = {}
 
     for event in events:
@@ -107,42 +112,65 @@ def aggregate_stage_costs(
         if stage in provenance and provenance[stage] != identity:
             raise ValueError("Cannot aggregate different calibration groups or contexts together")
         provenance[stage] = identity
-        key = (iteration, stage)
-        if phase == "forward_compute":
-            totals[key]["forward"] += float(event["elapsed_ms"])
-        else:
-            totals[key]["backward"] += float(event["elapsed_ms"])
+        samples[(stage, phase.removesuffix("_compute"))].append(event)
 
     rows = []
     for stage, layer_count in enumerate(layer_split):
-        forward_totals = []
-        backward_totals = []
-        for iteration in iterations:
-            values = totals.get((iteration, stage))
-            if values is None:
-                raise ValueError(
-                    f"missing calibration events for iteration {iteration}, stage {stage}"
+        phase_diagnostics = {}
+        for phase in ("forward", "backward"):
+            raw = samples[(stage, phase)]
+            accepted, filtering = isolate_timing_spikes(raw, quality_thresholds)
+            raw_by_iteration, cleaned_by_iteration = defaultdict(list), defaultdict(list)
+            for event in raw:
+                raw_by_iteration[int(event["iteration"])].append(float(event["elapsed_ms"]))
+            for event in accepted:
+                cleaned_by_iteration[int(event["iteration"])].append(float(event["elapsed_ms"]))
+            raw_totals, cleaned_totals, counts = [], [], []
+            for iteration in iterations:
+                values = raw_by_iteration[iteration]
+                if len(values) != num_microbatches:
+                    raise ValueError(
+                        f"Expected {num_microbatches} calibration events for iteration {iteration}, stage {stage}, phase {phase}; got {len(values)}"
+                    )
+                raw_totals.append(sum(values))
+                clean = cleaned_by_iteration[iteration]
+                counts.append(len(clean))
+                # Preserve the old B-normalized scale, but never divide a partial
+                # sum by B. An empty iteration stays zero and fails quality checks.
+                cleaned_totals.append(
+                    sum(clean)
+                    if len(clean) == num_microbatches
+                    else (sum(clean) * num_microbatches / len(clean) if clean else 0.0)
                 )
-            forward_totals.append(values["forward"])
-            backward_totals.append(values["backward"])
+
+            def cv(values):
+                mean = statistics.fmean(values)
+                return statistics.pstdev(values) / mean if mean else 0.0
+
+            phase_diagnostics[phase] = dict(
+                samples_ms=cleaned_totals,
+                raw_samples_ms=raw_totals,
+                global_iterations=iterations,
+                accepted_counts_by_iteration=counts,
+                min_ms=min(cleaned_totals),
+                max_ms=max(cleaned_totals),
+                cv=cv(cleaned_totals),
+                raw_cv=cv(raw_totals),
+                cleaned_cv=cv(cleaned_totals),
+                review_required=cv(cleaned_totals) > quality_thresholds.cv,
+                allocation_attribution="unknown: synchronized wall time includes dispatch/allocation stalls; use separate memory diagnosis",
+                samples_discarded=filtering["samples_discarded"],
+                raw_sample_count=filtering["raw_sample_count"],
+                accepted_sample_count=filtering["accepted_sample_count"],
+                discarded_fraction=filtering["discarded_fraction"],
+                outlier_filter=filtering,
+            )
+        forward_totals = phase_diagnostics["forward"]["samples_ms"]
+        backward_totals = phase_diagnostics["backward"]["samples_ms"]
         median_forward = statistics.median(forward_totals)
         median_backward = statistics.median(backward_totals)
         forward_op = median_forward / num_microbatches
         backward_op = median_backward / num_microbatches
-
-        def diagnostics(samples):
-            mean = statistics.fmean(samples)
-            cv = statistics.pstdev(samples) / mean if mean else 0.0
-            return dict(
-                samples_ms=samples,
-                global_iterations=iterations,
-                min_ms=min(samples),
-                max_ms=max(samples),
-                cv=cv,
-                review_required=cv > 0.1,
-                allocation_attribution="unknown: synchronized wall time includes dispatch/allocation stalls; use separate memory diagnosis",
-                samples_discarded=0,
-            )
 
         rows.append(
             {
@@ -153,8 +181,8 @@ def aggregate_stage_costs(
                 "forward_ms_per_op": forward_op,
                 "backward_ms_per_op": backward_op,
                 "backward_forward_ratio": backward_op / forward_op if forward_op else None,
-                "forward_diagnostics": diagnostics(forward_totals),
-                "backward_diagnostics": diagnostics(backward_totals),
+                "forward_diagnostics": phase_diagnostics["forward"],
+                "backward_diagnostics": phase_diagnostics["backward"],
                 **provenance.get(stage, {}),
             }
         )
@@ -172,6 +200,7 @@ def build_cost_profile(
     iteration_end: int,
     estimator: str = "min",
     percentile_value: float = 20.0,
+    quality_thresholds: QualityThresholds = QualityThresholds(),
 ) -> dict[str, object]:
     observed = aggregate_stage_costs(
         events,
@@ -179,6 +208,7 @@ def build_cost_profile(
         num_microbatches=num_microbatches,
         iteration_start=iteration_start,
         iteration_end=iteration_end,
+        quality_thresholds=quality_thresholds,
     )
     layers = [row["layer_count"] for row in observed]
     forward_obs = [row["forward_ms_per_op"] for row in observed]
@@ -219,7 +249,8 @@ def calibration_measurement_definition() -> dict:
         includes="CPU dispatch, compute, allocation/cache stalls inside the call and completion wait",
         excludes="explicit pipeline P2P calls outside stage compute and optimizer step",
         synchronization="device synchronization before/after each calibrated stage call; separate diagnostic run",
-        estimator="median across iteration totals divided by microbatch count; no samples discarded",
+        estimator="median across iteration means of accepted raw microbatch timings; equivalent B-normalized totals retained for diagnostics",
+        filtering="per-group/context/stage/phase upper-tail median+MAD AND median-ratio catastrophic spike filter; raw events unchanged; frequency/consecutive/iteration safeguards required",
         allocation_stability="not established by timing alone; review sample CV and pair with a separate memory capture",
         kernel_union_substitution=False,
     )

@@ -202,11 +202,15 @@ docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. slackpipe-dev \
   --warmup-iterations 20 --iterations 10
 ```
 
-The [profiling quality gate](docs/slackpipe_profile_quality.md) checks group CV,
-comparable cross-group shifts and fit residuals. It retains both attempts and
-repeats the complete collection once in fresh processes; a second failure stops
-automatic solver use. Legacy profiles without quality provenance are not newly
-validated merely because the runtime can parse them.
+The [profiling quality gate](docs/slackpipe_profile_quality.md) first detects rare
+catastrophic raw timing spikes per group/stage/phase using median/MAD and ratio
+tests. It records exclusions without modifying raw data, then checks cleaned CV,
+comparable cross-group shifts and fit residuals. Isolated spikes do not trigger
+retry; frequent/consecutive spikes or failed quality checks trigger one complete
+recollection in fresh processes. Both attempts remain available, and a second
+failure stops automatic solver use. Quality-v2 diagnostics include raw/cleaned
+statistics and every rejected sample; policy changes invalidate calibration
+receipts. Legacy profiles are not newly validated merely because they parse.
 
 Use the OR-enabled environment to export an evaluator-validated plan. The mounted
 checkout path is kept identical so the plan's cost-profile reference is also

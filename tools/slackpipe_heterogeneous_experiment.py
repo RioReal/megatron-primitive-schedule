@@ -242,6 +242,7 @@ def main():
                     num_microbatches=4,
                     iteration_start=args.warmup_iterations,
                     iteration_end=args.warmup_iterations + args.iterations - 1,
+                    quality_thresholds=thresholds_from_args(args),
                 )
                 for s, row in enumerate(rows):
                     layer_classes = [

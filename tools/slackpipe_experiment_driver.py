@@ -378,7 +378,10 @@ def calibrate(
     meta = {
         "kind": "calibration",
         "collection_schema": "slackpipe.collection.v1",
-        "quality_schema": "slackpipe.profile_quality.v1",
+        "quality_schema": "slackpipe.profile_quality.v2",
+        "quality_policy_source_digest": file_digest(
+            REPO / "megatron/core/pipeline_parallel/slackpipe/profile_quality.py"
+        ),
         "config": asdict(cfg),
         "seed_plan_digest": file_digest(seed_plan),
         "warmups": warmups,

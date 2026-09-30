@@ -275,17 +275,23 @@ if not a.profiling_attempt:
 
 
 @pytest.mark.parametrize("version", [1, 2])
-def test_quality_profile_cpp_compatibility(tmp_path, version):
+@pytest.mark.parametrize("filtered", [False, True])
+def test_quality_profile_cpp_compatibility(tmp_path, version, filtered):
     binary = Path(__file__).resolve().parents[3] / "slackpipe/build/no-or/slackpipe_cli"
     if not binary.is_file():
         pytest.skip("requires the no-OR C++ build")
     profile = stable_profile()
-    profile["calibration_partition"] = [8, 8]
+    if filtered:
+        from tests.unit_tests.pipeline_parallel.test_slackpipe_outliers import raw_profile
+
+        profile, _ = raw_profile(tmp_path, [(0, "forward", 13, 310)], stages=2)
+    profile["calibration_partition"] = [1, 1] if filtered else [8, 8]
+    layers = sum(profile["calibration_partition"])
     if version == 2:
         profile.update(
             schema_version="slackpipe.cost_profile.v2",
-            prefix_forward_us=[i * 1000.0 for i in range(17)],
-            prefix_backward_us=[i * 3100.0 for i in range(17)],
+            prefix_forward_us=[i * profile["a_fwd"] * 1000 for i in range(layers + 1)],
+            prefix_backward_us=[i * profile["a_bwd"] * 1000 for i in range(layers + 1)],
             stage_role_bias_us={
                 r: dict(forward=0.0, backward=0.0) for r in ("first", "middle", "last")
             },
@@ -305,7 +311,7 @@ def test_quality_profile_cpp_compatibility(tmp_path, version):
             "--J",
             "2",
             "--L",
-            "16",
+            str(layers),
             "--cost-profile",
             str(path),
             "--output-prefix",

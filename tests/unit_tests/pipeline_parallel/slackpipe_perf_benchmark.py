@@ -521,6 +521,7 @@ def _calibrate_cost_profile(args, plan, rank):
             iteration_end=args.calibration_warmup_iterations + args.calibration_iterations - 1,
             estimator=args.shared_slope_estimator,
             percentile_value=args.shared_slope_percentile,
+            quality_thresholds=thresholds_from_args(args),
         )
         profile["collection"] = dict(provenance, rank_metadata=all_provenance)
         (args.output_dir / "observations.json").write_text(

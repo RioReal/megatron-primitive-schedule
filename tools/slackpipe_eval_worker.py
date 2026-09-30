@@ -183,6 +183,7 @@ def run_worker(args) -> None:
                 num_microbatches=args.microbatches,
                 iteration_start=args.warmups,
                 iteration_end=args.warmups + args.iterations - 1,
+                quality_thresholds=thresholds_from_args(args),
             )
             for s, row in enumerate(rows):
                 row.update(
@@ -218,6 +219,7 @@ def run_worker(args) -> None:
                     num_microbatches=args.microbatches,
                     iteration_start=args.warmups,
                     iteration_end=args.warmups + args.iterations - 1,
+                    quality_thresholds=thresholds_from_args(args),
                     **common,
                 )
             profile["collection"] = dict(

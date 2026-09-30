@@ -180,6 +180,32 @@ def test_exact_standalone_three_campaign_one_reproduction(tmp_path, synthetic):
         ("repetitions", 5, {"benchmark"}),
         ("calibration_iterations", 20, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
         ("calibration_warmups", 8, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
+        (
+            "quality_outlier_mad_multiplier",
+            12,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
+        (
+            "quality_outlier_median_multiplier",
+            4,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
+        (
+            "quality_max_outlier_fraction",
+            0.01,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
+        (
+            "quality_max_outlier_iteration_fraction",
+            0.1,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
+        (
+            "quality_max_consecutive_outliers",
+            2,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
+        ("quality_min_outlier_samples", 30, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
         ("solver_seconds", 600, {"solve", "smoke", "benchmark", "trace"}),
         ("profiler_active", 4, {"trace"}),
         ("trace_warmups", 9, {"trace"}),
@@ -193,6 +219,63 @@ def test_stage_invalidation(tmp_path, synthetic, field, value, changed):
     assert {s for s in old if old[s] != new[s]} == changed
     assert all((tmp_path / p).is_dir() for p in old.values())
     assert list((tmp_path / "receipts/history").glob("*.json"))
+
+
+@pytest.mark.parametrize("systemic", [False, True])
+def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, systemic):
+    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+        ProfilingQualityError,
+        publish_profile,
+        thresholds_from_args,
+    )
+    from tests.unit_tests.pipeline_parallel.test_slackpipe_outliers import raw_profile
+
+    original = Experiment._worker
+    attempts = []
+
+    def worker(self, stage, directory, **kwargs):
+        if stage != "calibrate":
+            return original(self, stage, directory, **kwargs)
+        directory.mkdir(parents=True)
+        attempt = kwargs["attempt"]
+        attempts.append(attempt)
+        spikes = [
+            (4, "forward", 13, 356),
+            (2, "forward", 50, 313),
+            (5, "forward", 57, 306),
+            (3, "forward", 98, 286),
+        ]
+        if systemic:
+            spikes.append((4, "forward", 14, 356))
+        thresholds = thresholds_from_args(self.args)
+        profile, events = raw_profile(directory, spikes, thresholds=thresholds)
+        write_json(directory / "raw.json", events)
+        profile["model_config"] = dict(
+            model_config_hash=fingerprint(self.model),
+            dtype=self.args.precision,
+            sequence_length=self.args.seq_length,
+            micro_batch_size=self.args.micro_batch_size,
+        )
+        profile["parallel_config"] = {k: self.topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")}
+        publish_profile(
+            directory / "cost_profile.json", profile, thresholds=thresholds, attempt=attempt
+        )
+
+    monkeypatch.setattr(Experiment, "_worker", worker)
+    exp = Experiment(args_for(tmp_path, "benchmark"))
+    if systemic:
+        with pytest.warns(RuntimeWarning, match="Profiling measurements are inconsistent"):
+            with pytest.raises(ProfilingQualityError, match="retry exhausted"):
+                exp.execute()
+        assert attempts == [0, 1]
+        assert synthetic["solve"] == 0 and synthetic["slackpipe.benchmark"] == 0
+    else:
+        assert exp.execute()["status"] == "passed"
+        assert attempts == [0]
+        assert synthetic["solve"] == 1
+        assert synthetic["slackpipe.benchmark"] == exp.args.repetitions
+        profile = json.loads((tmp_path / exp.completed["calibrate"]["profile"]).read_text())
+        assert profile["quality"]["samples_discarded"] == 4
 
 
 @pytest.mark.parametrize("schedule", ["1f1b", "interleaved"])
