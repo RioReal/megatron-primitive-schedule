@@ -310,3 +310,101 @@ The actual Nemotron-H 4B raw events and affected-stage consensus costs cannot be
 reported without the missing ledger/data. The two supplied raw spike values and
 the supplied group-estimate patterns are covered by explicitly synthetic tests,
 not presented as analysis of those unavailable files.
+
+## Evidence-First Iteration Inspection (2026-10-01)
+
+The subsequent request identifies `calibrate-691347ced1ab`, attempt 1, with
+eight surviving within-group CV failures. Its raw events are not present in
+this checkout or the existing container; the requested external workspace is
+not mounted. The quoted CVs and group counts alone cannot distinguish rare
+iteration contamination from drift, two timing populations, or sustained
+instability. No iteration filter or empirically justified iteration thresholds
+have been enabled. CV remains 0.10; sample/group policy, retries, cost fitting,
+quality schema v3, and receipt/context semantics are unchanged. This is a
+diagnostic checkpoint, not completion of the requested three-level filter.
+
+Use the read-only replay tool once the attempt directory is accessible inside
+the container (`WORKER` is the directory containing the three input files):
+
+```bash
+docker exec -w /workspace/Megatron-LM slackpipe-dev /opt/venv/bin/python \
+  -m tools.slackpipe_inspect_iterations \
+  --profile WORKER/cost_profile.candidate.json \
+  --quality-report WORKER/cost_profile.quality.json \
+  --events WORKER/calibration_events.json \
+  --output WORKER/iteration-inspection.json
+```
+
+The output must not exist. The tool accepts the existing partition-bundle or
+flat raw-event JSON, requires explicit event provenance, replays the saved
+policy, and inspects **every remaining** `within_group_cv` failure. It verifies
+the quality issues against the candidate, exact microbatch coverage, the raw
+sample detector's decisions, per-iteration accepted counts, raw/cleaned totals,
+and the reported CV. Mismatched evidence fails before any output is written.
+It does not read group-excluded CVs as remaining failures or infer a group's
+identity from file/event order. Missing legacy provenance is an error.
+
+Output schema `slackpipe.iteration_inspection.v1` contains:
+
+- `inputs`: actual input paths and SHA-256 hashes; `diagnostic_only: true`;
+  unchanged profile status and recorded selected profile.
+- `failures`: group/attempt, stage/phase, exact range, role, worker, timing
+  context, manifest/composition where present, and original raw paths.
+- Each failure's `iterations`: global ID, ranks, raw and accepted microbatch
+  counts, raw total, B-normalized sample-cleaned total, accepted microbatch
+  mean/median/min/max. No iteration is discarded.
+- Raw and sample-cleaned iteration CV, median, MAD, robust sigma, relative and
+  signed deviations; half-window medians, adjacent changes and largest sorted
+  gap. These are descriptive evidence, **not** automated cause classifications.
+  Robust z is null when MAD is zero; that does not authorize exclusion.
+- Existing sample and group rejections separately, and explicitly unavailable
+  boundary attribution. Elapsed-only calibration events cannot establish clock,
+  allocator, CUDA/NCCL or pipeline-fill/drain causality.
+
+Exit 0 means diagnostic replay succeeded, **not** that the profile passed or the
+solver may run. This tool neither selects a profile nor launches solver/training.
+Original files are never modified. It cannot silently repair an inconsistent
+quality report or select the faster part of a distribution.
+
+Offline replay on the **different, previously recorded tiny-hybrid** attempt 1
+under `slackpipe_experiments/group_quality_20261001_fixed/calibration/` verified
+all eight of that run's remaining CV failures against raw events. For example,
+partition5/stage2/backward per-operation means (global iterations 20-29) are
+`[8.8070, 6.6080, 5.9826, 5.9951, 5.9902, 5.9869, 5.9839, 5.9929, 5.9755, 5.9905]`
+ms, CV 0.133585. Several stages have consecutive deviations at the beginning
+of the measured window, not evidence of isolated <=5% contamination. With only
+10 measured iterations even one exclusion is 10%. No samples/iterations were
+newly discarded, the three prior group exclusions remain, and the ledger still
+has `selected_profile: null`. The derived inspection JSON is retained locally
+alongside the original attempt and is excluded from Git.
+
+The saved metadata confirms calibration mode, profiler disabled, 20 full-step
+warmups and measurement IDs 20-29. Source inspection confirms no profiler
+wait/active/repeat or flush transition in this path; pre-call CUDA sync is
+outside the timer, completion sync inside, and cache clearing between
+partitions. This does not establish the physical cause of the initial shifts.
+No timing boundaries were changed based on this unrelated diagnostic run.
+
+The new regression suite tests stable, isolated slow/fast, two rare, 20%,
+balanced-cluster, and drift distributions as **unchanged diagnostic inputs**;
+sample-spike replay; exact group/range/context separation; missing/duplicate
+microbatches; stale evidence; input hashes; and refusal to overwrite files.
+These are not pass/fail tests of a third filter that has not been enabled:
+
+```bash
+docker exec -w /workspace/Megatron-LM slackpipe-dev /opt/venv/bin/python -m pytest \
+  tests/unit_tests/pipeline_parallel/test_slackpipe_iteration_inspection.py -q
+```
+
+The Nemotron-H 4B raw-distribution analysis, data-derived iteration thresholds,
+third-level filtering and real profiling/solver continuation remain blocked on
+the specified raw data and an appropriate GPU environment. No 4B profiling was
+rerun, and no claim is made that its eight CV failures are fixed.
+
+This diagnostic checkpoint passed 18 new inspection tests and 154 existing
+tests in `slackpipe-dev` (`test_slackpipe_outliers`, `test_slackpipe_group_quality`,
+`test_slackpipe_profile_quality`, `test_slackpipe_eval_receipts`,
+`test_slackpipe_cost_profile`, `test_slackpipe_collection`). The latter include
+fresh-process retry and campaign gating regressions. Black/isort checks and
+`git diff --check` passed. No new GPU training/calibration was performed; the
+raw-event replay above uses previously recorded data, not a new measurement.
