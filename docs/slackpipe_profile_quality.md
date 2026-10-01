@@ -313,6 +313,10 @@ not presented as analysis of those unavailable files.
 
 ## Evidence-First Iteration Inspection (2026-10-01)
 
+For the subsequent repeatable cross-partition anomalies, see
+[compute timing diagnostics](slackpipe_compute_timing.md). That probe is
+independent of filtering and cannot publish a solver cost profile.
+
 The subsequent request identifies `calibrate-691347ced1ab`, attempt 1, with
 eight surviving within-group CV failures. Its raw events are not present in
 this checkout or the existing container; the requested external workspace is

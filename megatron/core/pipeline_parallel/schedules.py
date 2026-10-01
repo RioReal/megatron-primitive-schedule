@@ -46,13 +46,20 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 Shape = Union[List[int], torch.Size]
 _SLACKPIPE_COST_CALIBRATION_EVENTS = None
 _SLACKPIPE_COST_CALIBRATION_ITERATION = None
+_SLACKPIPE_TIMING_DIAGNOSTIC = None
 
 
-def begin_slackpipe_cost_calibration_iteration(iteration: int) -> None:
-    """Enable synchronized compute-only calibration for one schedule iteration."""
+def begin_slackpipe_cost_calibration_iteration(iteration: int, *, diagnostic=None) -> None:
+    """Enable legacy calibration, or an explicitly non-cost timing diagnostic."""
 
     global _SLACKPIPE_COST_CALIBRATION_EVENTS
     global _SLACKPIPE_COST_CALIBRATION_ITERATION
+    global _SLACKPIPE_TIMING_DIAGNOSTIC
+    if _SLACKPIPE_COST_CALIBRATION_EVENTS is not None:
+        raise RuntimeError("Calibration iteration already active")
+    if diagnostic is not None:
+        diagnostic.begin(iteration)
+    _SLACKPIPE_TIMING_DIAGNOSTIC = diagnostic
     _SLACKPIPE_COST_CALIBRATION_EVENTS = []
     _SLACKPIPE_COST_CALIBRATION_ITERATION = iteration
 
@@ -62,9 +69,14 @@ def end_slackpipe_cost_calibration_iteration() -> List[Dict[str, object]]:
 
     global _SLACKPIPE_COST_CALIBRATION_EVENTS
     global _SLACKPIPE_COST_CALIBRATION_ITERATION
+    global _SLACKPIPE_TIMING_DIAGNOSTIC
     events = _SLACKPIPE_COST_CALIBRATION_EVENTS or []
     _SLACKPIPE_COST_CALIBRATION_EVENTS = None
     _SLACKPIPE_COST_CALIBRATION_ITERATION = None
+    diagnostic = _SLACKPIPE_TIMING_DIAGNOSTIC
+    _SLACKPIPE_TIMING_DIAGNOSTIC = None
+    if diagnostic is not None:
+        return diagnostic.finish()
     return events
 
 
@@ -78,10 +90,28 @@ def _run_with_slackpipe_cost_calibration(
     if _SLACKPIPE_COST_CALIBRATION_EVENTS is None:
         return compute()
 
+    if _SLACKPIPE_TIMING_DIAGNOSTIC is not None:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        return _SLACKPIPE_TIMING_DIAGNOSTIC.compute(
+            compute,
+            dict(
+                rank=torch.distributed.get_rank(),
+                pp_rank=pp_rank,
+                vp_rank=model_chunk_id,
+                model_chunk_id=model_chunk_id,
+                logical_stage=model_chunk_id * pp_size + pp_rank,
+                microbatch=microbatch,
+                phase=phase,
+            ),
+        )
+
+    pre_sync_start = time.perf_counter()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.synchronize()
     start = time.perf_counter()
     result = compute()
+    compute_return = time.perf_counter()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.synchronize()
     end = time.perf_counter()
@@ -100,6 +130,11 @@ def _run_with_slackpipe_cost_calibration(
             "microbatch": microbatch,
             "phase": phase,
             "elapsed_ms": (end - start) * 1000.0,
+            "existing_stage_wall_ms": (end - start) * 1000.0,
+            "cpu_wall_ms": (compute_return - start) * 1000.0,
+            "pre_compute_sync_ms": (start - pre_sync_start) * 1000.0,
+            "completion_sync_ms": (end - compute_return) * 1000.0,
+            "compute_position": len(_SLACKPIPE_COST_CALIBRATION_EVENTS),
         }
     )
     return result

@@ -57,6 +57,11 @@ from megatron.core.pipeline_parallel.slackpipe.schedule import (
     shutdown_slackpipe_runtime,
     slackpipe_transport_statistics,
 )
+from megatron.core.pipeline_parallel.slackpipe.timing_diagnostic import (
+    ComputeTimingDiagnostic,
+    DiagnosticP2PCommunicator,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.pipeline_parallel.slackpipe_perf_benchmark import _make_batches
 from tests.unit_tests.pipeline_parallel.test_slackpipe_model_construction import (
     _batch_iterator,
@@ -184,6 +189,9 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
         else None
     )
     vpp = getattr(args, "vpp", args.stages // args.pp)
+    diagnose = getattr(args, "diagnose_compute_timing", False)
+    if diagnose and (collect != "calibrate" or schedule != "default" or vpp < 2):
+        raise ValueError("Timing diagnosis requires native interleaved calibration (VPP >= 2)")
 
     def provider(
         pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
@@ -252,6 +260,18 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
     )
 
     smoke_updates = []
+    diagnostic = None
+    schedule_kwargs = {}
+    if diagnose:
+        diagnostic = ComputeTimingDiagnostic(2 * args.num_microbatches * len(model))
+        schedule_kwargs = dict(
+            p2p_communicator=DiagnosticP2PCommunicator(
+                parallel_state.get_pipeline_model_parallel_group(), config, diagnostic
+            ),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                ["tp", "cp", "embd", "pos_embd", "pp", "dp_cp", "tp_dp_cp"]
+            ),
+        )
 
     def iteration():
         optimizer.zero_grad(set_to_none=True)
@@ -263,6 +283,7 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             forward_only=False,
+            **schedule_kwargs,
         )
         probes = []
         if getattr(args, "verify_update", False):
@@ -321,13 +342,31 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
             memory_after_warmup=memory_sample(),
         )
         for i in measured["measurement_iterations"]:
-            begin_slackpipe_cost_calibration_iteration(i)
+            begin_slackpipe_cost_calibration_iteration(i, diagnostic=diagnostic)
             try:
                 losses = iteration()
             finally:
                 events.extend(end_slackpipe_cost_calibration_iteration())
             assert_finite(losses)
         measured["memory_end"] = memory_sample()
+        if diagnose and len(events) != args.iterations * 2 * args.num_microbatches * len(model):
+            raise RuntimeError("Incomplete diagnostic operation coverage")
+        measured["timing_diagnostic"] = (
+            dict(
+                schema_version="slackpipe.compute_timing_diagnostic.v1",
+                diagnostic_only=True,
+                estimator="compute-stream-events-diagnostic-v1",
+                compute_gpu_ms="current-stream event envelope; includes in-region waits and launch gaps; not kernel sum",
+                cpu_wall_ms="host compute closure without added completion wait; not existing stage wall time",
+                existing_stage_wall_ms="unavailable in this run: legacy device-wide synchronization would perturb the probe",
+                p2p_wall_ms="inclusive native P2P call CPU time; contains native waits/sync; not additive to GPU envelopes",
+                wait_synchronization_ms="per-operation decomposition unavailable; completion_wait_ms measured once after optimizer",
+                side_stream_coverage="only work joined to compute stream is covered; full-step drain does not extend per-op intervals",
+                iterations=diagnostic.iterations,
+            )
+            if diagnose
+            else None
+        )
     else:
         metadata = dict(
             pp=args.pp,
@@ -388,31 +427,48 @@ def run_partition(args, config, manifest, plan, output: Path, collect: str) -> l
     if collect == "calibrate":
         from megatron.core.pipeline_parallel.slackpipe.profile_quality import tag_calibration_events
 
+        configuration = dict(
+            manifest=manifest["manifest_hash"],
+            pp=args.pp,
+            stages=args.stages,
+            microbatches=args.num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            precision=args.precision,
+            warmups=args.warmups,
+            iterations=args.iterations,
+            seed=args.seed,
+            learning_rate=args.learning_rate,
+            environment=measured["environment"],
+            schedule="native",
+            batch_p2p_comm=config.batch_p2p_comm,
+            batch_p2p_sync=config.batch_p2p_sync,
+            overlap_p2p_comm=config.overlap_p2p_comm,
+        )
+        measured["calibration_configuration"] = configuration
+        basename = "timing_events" if diagnose else "calibration_events"
         tag_calibration_events(
             events,
             group=output.name,
             ranges=plan.stage_layer_ranges,
             worker=rank,
             attempt=getattr(args, "profiling_attempt", 0),
-            raw_path=output / f"calibration_events.rank{rank}.json",
+            raw_path=output / f"{basename}.rank{rank}.json",
             configuration=dict(
-                manifest=manifest["manifest_hash"],
-                pp=args.pp,
-                stages=args.stages,
-                microbatches=args.num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
-                precision=args.precision,
-                warmups=args.warmups,
-                iterations=args.iterations,
-                seed=args.seed,
-                learning_rate=args.learning_rate,
-                environment=measured["environment"],
-                timing="synchronized-stage-wall-time-v1",
-                schedule="native",
+                **configuration,
+                timing=(
+                    "compute-stream-events-diagnostic-v1"
+                    if diagnose
+                    else "synchronized-stage-wall-time-v1"
+                ),
             ),
         )
-        write_json(output / f"calibration_events.rank{rank}.json", events)
+        for event in events:
+            begin, end = event["stage_layer_range"]
+            event["layer_composition"] = [
+                layer["config_class"] for layer in manifest["layers"][begin:end]
+            ]
+        write_json(output / f"{basename}.rank{rank}.json", events)
     write_json(output / f"result.rank{rank}.json", measured)
     gathered = [None] * args.pp
     dist.all_gather_object(gathered, events)
@@ -453,8 +509,18 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     parser.add_argument("--tiny", action="store_true")
+    parser.add_argument(
+        "--diagnose-compute-timing",
+        action="store_true",
+        help="Diagnostic only: CUDA stream events, no profile fitting or solver authorization",
+    )
     args = parser.parse_args()
-    if list(args.output.glob("result.rank*.json")) or (args.output / "cost_profile.json").exists():
+    if (
+        list(args.output.glob("result.rank*.json"))
+        or list(args.output.glob("partition*/result.rank*.json"))
+        or (args.output / "cost_profile.json").exists()
+        or (args.output / "timing_events.json").exists()
+    ):
         parser.error("Refusing to overwrite an existing collection; use a fresh --output")
     args.pp = int(os.environ["WORLD_SIZE"])
     if (not args.tiny and args.pp != 4) or args.pp not in (2, 4):
@@ -525,6 +591,9 @@ def main() -> None:
             events = run_partition(args, config, manifest, plan, output, args.action)
             if args.action == "calibrate" and rank == 0:
                 raw.append(dict(cuts=cuts, events=events))
+                if args.diagnose_compute_timing:
+                    write_json(args.output / "timing_events.json", raw)
+                    continue
                 rows = aggregate_stage_costs(
                     events,
                     layer_split=plan.layer_split,
@@ -541,7 +610,7 @@ def main() -> None:
                     )
                 observed.extend(rows)
                 write_json(args.output / "calibration_events.json", raw)
-        if args.action == "calibrate" and rank == 0:
+        if args.action == "calibrate" and rank == 0 and not args.diagnose_compute_timing:
             write_json(args.output / "observations.json", observed)
             profile = build_heterogeneous_cost_profile(
                 model_manifest=manifest,
@@ -592,6 +661,7 @@ def main() -> None:
         dist.destroy_process_group()
         if (
             args.action == "calibrate"
+            and not args.diagnose_compute_timing
             and rank == 0
             and not (args.output / "cost_profile.json").is_file()
         ):

@@ -100,6 +100,7 @@ def validate_profile(
 
 
 def run_worker(args) -> None:
+    diagnose = getattr(args, "diagnose_compute_timing", False)
     model = load_model(args.model_config)
     topology = schedule_topology(args.schedule, args.pp, args.logical_stages, args.microbatches)
     args.stages, args.vpp, args.num_microbatches = (
@@ -177,6 +178,9 @@ def run_worker(args) -> None:
         )
         if rank == 0 and args.action == "calibrate":
             raw.extend(events)
+            if diagnose:
+                write_json(args.output / "timing_events.json", raw)
+                continue
             rows = aggregate_stage_costs(
                 events,
                 layer_split=plan.layer_split,
@@ -194,7 +198,7 @@ def run_worker(args) -> None:
             observations.extend(rows)
     if rank == 0:
         write_json(args.output / "model_manifest.json", manifest)
-        if args.action == "calibrate":
+        if args.action == "calibrate" and not diagnose:
             write_json(args.output / "observations.json", observations)
             write_json(args.output / "calibration_events.json", raw)
             common = dict(
@@ -244,6 +248,7 @@ def run_worker(args) -> None:
     dist.destroy_process_group()
     if (
         args.action == "calibrate"
+        and not diagnose
         and rank == 0
         and not (args.output / "cost_profile.json").is_file()
     ):
@@ -257,6 +262,11 @@ def main() -> None:
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--diagnose-compute-timing",
+        action="store_true",
+        help="Diagnostic only; never emit a solver cost profile",
+    )
     args = normalize_args(parser.parse_args())
     args.action = args.stage
     args.memory_history_entries = 100000
