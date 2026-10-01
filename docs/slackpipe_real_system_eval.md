@@ -205,7 +205,7 @@ the ignored `slackpipe_experiments/five_method_publication_20260930/` directory.
 
 ```text
 env -> small numerical-equivalence gate -> target-model native smoke
-    -> native calibration -> C++ solve -> target-model SlackPipe smoke
+    -> isolated layer calibration -> C++ solve -> target-model SlackPipe smoke
     -> independent unprofiled benchmarks -> separate trace capture
 ```
 
@@ -218,19 +218,24 @@ finite parameters/loss/all gradients, a representable optimizer update on every
 rank, and empty transport state after collective teardown. No expensive tracing
 or update probes are enabled by the benchmark step.
 
-Each size/family gets its own calibration. LLaMA-style uses the existing
-cost_profile.v1 shared slope and per-stage biases, not hybrid regression. Hybrid
-models use native class-identifiable partitions and cost_profile.v2 exact ranges.
-Costs remain synchronized stage-call wall times including dispatch/allocation
-stalls, excluding P2P outside the stage and SGD. Per-iteration observations,
-variability and review flags remain available; this is not a sum-of-kernels model.
-Inspect unstable fits and separate memory diagnosis before drawing conclusions.
+Each size/family gets its own calibration. The default estimator is now
+`isolated-layer-compute-v1`: one actual layer/class at a time, independent F/B
+CUDA-event measurements, no pipeline communication, and v2 costs expanded in
+manifest order. Embedding and final norm/head/loss are separate role biases.
+See [isolated calibration](slackpipe_isolated_calibration.md) for the exact timing
+boundary, simple sample/CV policy, retry and one-GPU collection commands.
 
-Profile hash, model-config hash, manifest hash (hybrid), precision, sequence,
-microbatch shape and topology must match. The existing homogeneous C++ exporter
-emits compatible plan.v1 without a profile hash; a separate
+Explicit `--calibration-estimator existing-stage-wall-time-v1` retains the older
+path: LLaMA v1 shared slope/stage biases, hybrid class-identifiable partitions and
+v2 range fitting. These are effective synchronized stage wall times, including
+dispatch/allocation stalls and pipeline context, not isolated compute. Legacy
+group-consensus and fit checks are unchanged. The two estimators need not agree.
+
+Profile hash, model-config hash, manifest hash (all v2 profiles), precision, sequence,
+microbatch shape and topology must match. The legacy homogeneous v1 cost exporter
+emits plan.v1 without a profile hash; a separate
 `slackpipe.eval_plan_binding.v1` binds unchanged plan/profile file SHA256s.
-Hybrid plan.v2 retains embedded profile/manifest hashes. Worker lists always come
+Both homogeneous and hybrid v2 plans retain embedded profile/manifest hashes. Worker lists always come
 from C++ validated schedule export, never reconstructed from a heuristic.
 
 ### Stage-specific Receipts and Resume
@@ -247,7 +252,7 @@ Additional inputs are stage-specific:
 | env | Hardware/dependency/allocator settings; no iteration policy |
 | correctness | env; pinned small-fixture test selected by PP/precision/transport |
 | native-smoke / smoke | correctness or solve; actual native/requested schedule, seed, learning rate, smoke warmups/iterations |
-| calibrate | native-smoke; native schedule, seed/LR, calibration warmups/iterations, partition-design and existing estimator identity |
+| calibrate | native-smoke; estimator, model/manifest and class signatures, isolated execution and sample/quality policy; or explicit legacy partition-design/fit policy |
 | solve | calibration context and artifact hashes; executable SHA256, algorithm, time limit, seed, worker count and fixed solver options |
 | benchmark | smoke/model/plan; schedule, seed/LR, benchmark warmups/iterations; repetition index or standalone group count |
 | trace | smoke/model/plan; schedule, seed/LR, trace warmups, profiler schedule/options and trace format |
@@ -259,12 +264,12 @@ share immutable artifact directories across methods, without overwriting another
 method's receipt. Different N/PP or other relevant inputs prevent sharing.
 
 Warmups are now independent: `--warmups` controls benchmark only;
-`--calibration-warmups`, `--smoke-warmups` and `--trace-warmups` default to five.
+Legacy `--calibration-warmups`, `--smoke-warmups` and `--trace-warmups` default to five.
 `--smoke-iterations` defaults to two; `--calibration-iterations` defaults to ten.
-Set all four warmups explicitly for a common twenty-step stability diagnostic.
+Isolated calibration instead uses `--isolated-profile-warmups` (20) and
+`--isolated-profile-iterations` (30), each counting a complete isolated F/B pair.
 Non-trace workers receive fixed unused profiler defaults, preventing trace flags
-from leaking into benchmark metadata. Training and calibration implementations
-and mathematical definitions are unchanged.
+from leaking into benchmark metadata. Runtime training/benchmark timing is unchanged.
 
 Examples of invalidation under `--resume`:
 
@@ -272,7 +277,7 @@ Examples of invalidation under `--resume`:
   not redo env, correctness, calibration, solve or existing indexed benchmarks.
 - Changing benchmark `--warmups`/`--iterations` creates new benchmark attempts
   only, not calibration, solve or independently captured traces.
-- Changing `--calibration-iterations`/`--calibration-warmups` creates calibration,
+- Changing estimator or its active calibration warmup/sample/quality policy creates calibration,
   solve and downstream optimized smoke/benchmark/trace attempts. Native baseline
   benchmarks do not depend on SlackPipe calibration.
 - Changing `--solver-seconds` or executable bytes changes solve and downstream

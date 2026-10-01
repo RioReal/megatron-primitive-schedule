@@ -93,7 +93,10 @@ def validate_profile(
         raise ValueError("Calibration profile fingerprint mismatch")
     if profile["parallel_config"] != {k: topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")}:
         raise ValueError("Calibration topology mismatch")
-    if model["model_family"] == "nemotron_h":
+    if (
+        model["model_family"] == "nemotron_h"
+        or profile.get("schema_version") == "slackpipe.cost_profile.v2"
+    ):
         manifest = build_model_manifest(transformer_config(model, topology, precision))
         if profile.get("model_manifest_hash") != manifest["manifest_hash"]:
             raise ValueError("Calibration manifest mismatch")
@@ -101,6 +104,14 @@ def validate_profile(
 
 def run_worker(args) -> None:
     diagnose = getattr(args, "diagnose_compute_timing", False)
+    if (
+        args.action == "calibrate"
+        and not diagnose
+        and args.calibration_estimator == "isolated-layer-compute-v1"
+    ):
+        raise ValueError(
+            "Use tools.slackpipe_isolated_profile in a single process, or the campaign launcher"
+        )
     model = load_model(args.model_config)
     topology = schedule_topology(args.schedule, args.pp, args.logical_stages, args.microbatches)
     args.stages, args.vpp, args.num_microbatches = (

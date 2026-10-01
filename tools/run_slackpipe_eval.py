@@ -48,7 +48,10 @@ STAGES = (
 
 
 def argument_parser() -> argparse.ArgumentParser:
+    from megatron.core.pipeline_parallel.slackpipe.isolated_profile import add_arguments
+
     parser = argparse.ArgumentParser(description=__doc__)
+    add_arguments(parser)
     add_quality_arguments(parser)
     parser.add_argument("stage", choices=STAGES)
     parser.add_argument("--model-config", type=Path, required=True)
@@ -128,6 +131,12 @@ def normalize_args(args):
         raise ValueError("Invalid calibration/profiler schedule")
     if args.run_index is not None and args.run_index < 0:
         raise ValueError("run-index must be non-negative")
+    if args.calibration_estimator == "isolated-layer-compute-v1" and (
+        args.isolated_profile_warmups < 1
+        or args.isolated_profile_iterations < 10
+        or not 0 < args.isolated_profile_max_cv < 1
+    ):
+        raise ValueError("Invalid isolated warmup/sample/CV policy")
     args.output, args.model_config, args.solver = (
         p.resolve() for p in (args.output, args.model_config, args.solver)
     )
@@ -293,6 +302,41 @@ class Experiment:
                 quality_schema="slackpipe.profile_quality.v3",
                 automatic_retry_limit=1,
             )
+            from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
+                ESTIMATOR,
+                IsolatedPolicy,
+                class_mapping,
+                execution_signature,
+            )
+
+            if args.calibration_estimator == ESTIMATOR:
+                from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
+                from tools.slackpipe_eval_config import transformer_config
+
+                manifest = build_model_manifest(
+                    transformer_config(self.model, dict(pp=1, vpp=None), args.precision)
+                )
+                execution = execution_signature(
+                    self.model,
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    precision=args.precision,
+                )
+                policy = dict(
+                    estimator=ESTIMATOR,
+                    warmups=args.isolated_profile_warmups,
+                    iterations=args.isolated_profile_iterations,
+                    statistic="median",
+                    quality_schema="slackpipe.isolated_profile_quality.v1",
+                    quality=asdict(IsolatedPolicy(max_cv=args.isolated_profile_max_cv)),
+                    automatic_retry_limit=1,
+                    model_manifest_hash=manifest["manifest_hash"],
+                    execution=execution,
+                    class_signatures=[
+                        c["class_signature"] for c in class_mapping(manifest, execution)
+                    ],
+                )
+                context["schedule"] = "isolated-no-pipeline"
         elif stage == "solve":
             context.update(
                 solver_sha256=digest(args.solver) if args.solver.is_file() else None,
@@ -433,6 +477,20 @@ class Experiment:
             command += ["--profiling-attempt", attempt]
             for key, value in asdict(thresholds_from_args(args)).items():
                 command += [f"--quality-{key.replace('_', '-')}", value]
+            command += ["--calibration-estimator", args.calibration_estimator]
+            if args.calibration_estimator == "isolated-layer-compute-v1":
+                command = [
+                    sys.executable,
+                    "-m",
+                    "tools.slackpipe_isolated_profile",
+                    *command[command.index("tools.slackpipe_eval_worker") + 1 :],
+                ]
+                for name in (
+                    "isolated_profile_warmups",
+                    "isolated_profile_iterations",
+                    "isolated_profile_max_cv",
+                ):
+                    command += ["--" + name.replace("_", "-"), getattr(args, name)]
         self._execute(command, directory.parent, directory.name)
 
     def ensure(self, stage):

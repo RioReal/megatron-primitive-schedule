@@ -759,6 +759,11 @@ def publish_profile(
 
 def require_profile_quality(profile: dict) -> None:
     """Reject missing/failed quality receipts, including reused legacy profiles."""
+    from .isolated_profile import ESTIMATOR, require_quality
+
+    if profile.get("estimator") == ESTIMATOR:
+        require_quality(profile)
+        return
     quality = profile.get("quality", {})
     if quality.get("status") != "passed" or quality.get("quality_schema_version") not in (
         "slackpipe.profile_quality.v1",

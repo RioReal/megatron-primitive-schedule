@@ -57,6 +57,30 @@ def collect_with_retry(directory: Path, collect, configuration: dict) -> Path:
             ended_at=datetime.now(timezone.utc).isoformat(), quality=report, status=report["status"]
         )
         candidate = json.loads((worker / "cost_profile.candidate.json").read_text())
+        expected_estimator = configuration.get("policy", {}).get("estimator")
+        if (
+            expected_estimator == "isolated-layer-compute-v1"
+            and candidate.get("estimator") != expected_estimator
+        ):
+            raise ProfilingQualityError("Collector returned a different calibration estimator")
+        if expected_estimator == "isolated-layer-compute-v1":
+            policy = configuration["policy"]
+            context = candidate["isolated"]["context"]
+            for key, value in (
+                ("model_manifest_hash", candidate["model_manifest_hash"]),
+                ("warmups", context["warmups"]),
+                ("iterations", context["iterations"]),
+                ("quality", context["policy"]),
+                ("execution", context["execution"]),
+                ("statistic", context.get("statistic", "median")),
+                ("quality_schema", candidate["quality"]["quality_schema_version"]),
+                (
+                    "class_signatures",
+                    [c["class_signature"] for c in candidate["isolated"]["classes"]],
+                ),
+            ):
+                if key in policy and policy[key] != value:
+                    raise ProfilingQualityError(f"Isolated receipt/collector {key} mismatch")
         identity = sorted(
             json.dumps(
                 {
@@ -71,8 +95,10 @@ def collect_with_retry(directory: Path, collect, configuration: dict) -> Path:
                 },
                 sort_keys=True,
             )
-            for row in candidate["observed_stages"]
+            for row in candidate.get("observed_stages", [])
         )
+        if candidate.get("estimator") == "isolated-layer-compute-v1":
+            identity.append(json.dumps(candidate["isolated"]["context"], sort_keys=True))
         identity.append(json.dumps(report["thresholds"], sort_keys=True))
         if reference is None:
             reference = identity
@@ -133,6 +159,8 @@ def main() -> None:
             "observations.json",
             "model_manifest.json",
             "model.json",
+            "isolated_profile_raw.json",
+            "isolated_profile_summary.json",
         ):
             source = selected.parent / name
             target = args.collect_output / name

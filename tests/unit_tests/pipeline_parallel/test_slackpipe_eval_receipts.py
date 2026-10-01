@@ -26,7 +26,16 @@ CONFIG = Path(__file__).resolve().parents[3] / "configs/slackpipe_eval/llama_8b.
 
 def args_for(root, stage="solve", **updates):
     args = argument_parser().parse_args(
-        [stage, "--model-config", str(CONFIG), "--output", str(root), "--resume"]
+        [
+            stage,
+            "--model-config",
+            str(CONFIG),
+            "--output",
+            str(root),
+            "--resume",
+            "--calibration-estimator",
+            "existing-stage-wall-time-v1",
+        ]
     )
     for key, value in updates.items():
         setattr(args, key, value)
@@ -104,6 +113,42 @@ def synthetic(monkeypatch):
                 parallel_config={k: self.topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")},
             )
             profile.update(stable_profile())
+            if a.calibration_estimator == "isolated-layer-compute-v1":
+                from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
+                    execution_signature,
+                )
+                from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
+                from tests.unit_tests.pipeline_parallel.test_slackpipe_isolated_profile import (
+                    fixture_profile,
+                )
+                from tools.slackpipe_eval_config import transformer_config
+
+                isolated = fixture_profile(
+                    warmups=a.isolated_profile_warmups,
+                    iterations=a.isolated_profile_iterations,
+                    max_cv=a.isolated_profile_max_cv,
+                    manifest=build_model_manifest(
+                        transformer_config(self.model, self.topology, a.precision)
+                    ),
+                    execution=execution_signature(
+                        self.model,
+                        seq_length=a.seq_length,
+                        micro_batch_size=a.micro_batch_size,
+                        precision=a.precision,
+                    ),
+                )
+                isolated.update(
+                    model_config=profile["model_config"], parallel_config=profile["parallel_config"]
+                )
+                from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
+                    profile_fingerprint,
+                )
+
+                isolated["cost_profile_hash"] = profile_fingerprint(isolated)
+                write_json(directory / "cost_profile.json", isolated)
+                write_json(directory / "cost_profile.candidate.json", isolated)
+                write_json(directory / "cost_profile.quality.json", isolated["quality"])
+                return
             publish_profile(
                 directory / "cost_profile.json", profile, attempt=kwargs.get("attempt", 0)
             )
@@ -283,6 +328,13 @@ def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, syst
             micro_batch_size=self.args.micro_batch_size,
         )
         profile["parallel_config"] = {k: self.topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")}
+        if profile["schema_version"] == "slackpipe.cost_profile.v2":
+            from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
+            from tools.slackpipe_eval_config import transformer_config
+
+            profile["model_manifest_hash"] = build_model_manifest(
+                transformer_config(self.model, self.topology, self.args.precision)
+            )["manifest_hash"]
         publish_profile(
             directory / "cost_profile.json", profile, thresholds=thresholds, attempt=attempt
         )
@@ -614,6 +666,8 @@ def test_real_campaign_partial_resume_three_repetitions(tmp_path, synthetic, mon
             "--repetitions",
             "3",
             "--resume",
+            "--calibration-estimator",
+            "existing-stage-wall-time-v1",
         ],
     )
     campaign.main()
@@ -640,6 +694,19 @@ def test_indexed_repetition_count_does_not_change_identity(tmp_path, synthetic):
     second = execute(tmp_path, "benchmark", run_index=0, repetitions=6)
     assert directories(first) == directories(second)
     assert synthetic == before
+
+
+def test_isolated_receipt_resume_and_policy_invalidation(tmp_path, synthetic):
+    estimator = "isolated-layer-compute-v1"
+    first = execute(tmp_path, "solve", calibration_estimator=estimator)
+    before = synthetic.copy()
+    second = execute(tmp_path, "solve", calibration_estimator=estimator)
+    assert directories(first) == directories(second) and synthetic == before
+    third = execute(
+        tmp_path, "solve", calibration_estimator=estimator, isolated_profile_iterations=40
+    )
+    assert third.completed["calibrate"]["directory"] != first.completed["calibrate"]["directory"]
+    assert synthetic["slackpipe.calibrate"] == before["slackpipe.calibrate"] + 1
 
 
 def test_force_preserves_history_and_full_overrides_resume(tmp_path, synthetic):
@@ -704,7 +771,19 @@ def test_legacy_across_receipt_only_source_fix(tmp_path, synthetic, monkeypatch)
 
 def test_fresh_campaign_shares_only_compatible_upstream_work(tmp_path, synthetic, monkeypatch):
     monkeypatch.setattr(
-        sys, "argv", ["campaign", "--families", "llama", "--sizes", "8b", "--output", str(tmp_path)]
+        sys,
+        "argv",
+        [
+            "campaign",
+            "--families",
+            "llama",
+            "--sizes",
+            "8b",
+            "--output",
+            str(tmp_path),
+            "--calibration-estimator",
+            "existing-stage-wall-time-v1",
+        ],
     )
     campaign.main()
     assert synthetic["correctness"] == 3  # Physical, base VPP, and refined VPP topologies.

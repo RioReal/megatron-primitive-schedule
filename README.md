@@ -24,7 +24,7 @@ Upstream attribution, documentation, and installation guidance are preserved bel
 SlackPipe connects offline pipeline partition/schedule optimization to execution:
 
 ```text
-ordinary Megatron calibration -> cost profile -> ./slackpipe C++ CP-SAT optimizer
+isolated Megatron layer calibration -> cost profile -> ./slackpipe C++ CP-SAT optimizer
     -> slackpipe.plan -> Megatron SlackPipe execution
 ```
 
@@ -185,12 +185,21 @@ groups when embedding the runtime; the provided harnesses perform this cleanup.
 
 ### Calibration and plan generation
 
-**Calibration is intentionally intrusive:** synchronized profiling measures
-primitive compute costs during ordinary Megatron execution. **Performance runs
+The generic campaign now defaults to **isolated layer/class calibration**
+(`isolated-layer-compute-v1`): real Megatron F/B kernels, one representative unit
+at a time, without pipeline scheduling or communication. It expands measured
+medians in manifest order into existing v2 prefix costs, with separate embedding
+and output/loss biases. It does not construct the full model. See
+[isolated calibration](docs/slackpipe_isolated_calibration.md) for one-GPU commands,
+timing boundaries, the 20/30 warmup/sample policy, retry, artifacts and limitations.
+The old `existing-stage-wall-time-v1` remains explicitly selectable for diagnostics;
+its context-dependent stage latency need not equal isolated compute costs.
+
+**Calibration is intentionally intrusive. Performance runs
 must disable calibration profiling**, and should keep diagnostic operation
 profiling separate from measured iterations. Profiler figures are not benchmarks.
 
-For a small heterogeneous calibration, run from the repository root:
+For a small **legacy pipeline-context** heterogeneous calibration, run from the repository root:
 
 ```bash
 docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. slackpipe-dev \
@@ -202,7 +211,7 @@ docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. slackpipe-dev \
   --warmup-iterations 20 --iterations 10
 ```
 
-The [profiling quality gate](docs/slackpipe_profile_quality.md) first detects rare
+The legacy [profiling quality gate](docs/slackpipe_profile_quality.md) first detects rare
 catastrophic raw timing spikes per group/stage/phase using median/MAD and ratio
 tests. Heterogeneous calibration also detects isolated high or low group estimates
 against an exact-range/composition majority, requiring at least three survivors.
