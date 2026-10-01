@@ -290,7 +290,7 @@ class Experiment:
                 ),
                 estimator="existing-stage-wall-time-v1",
                 quality=asdict(thresholds_from_args(args)),
-                quality_schema="slackpipe.profile_quality.v2",
+                quality_schema="slackpipe.profile_quality.v3",
                 automatic_retry_limit=1,
             )
         elif stage == "solve":

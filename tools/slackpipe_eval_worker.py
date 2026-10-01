@@ -210,7 +210,10 @@ def run_worker(args) -> None:
             )
             if hybrid:
                 profile = build_heterogeneous_cost_profile(
-                    model_manifest=manifest, observed_stage_rows=observations, **common
+                    model_manifest=manifest,
+                    observed_stage_rows=observations,
+                    quality_thresholds=thresholds_from_args(args),
+                    **common,
                 )
             else:
                 profile = build_cost_profile(

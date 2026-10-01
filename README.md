@@ -204,12 +204,14 @@ docker exec -w /workspace/Megatron-LM -e PYTHONPATH=. slackpipe-dev \
 
 The [profiling quality gate](docs/slackpipe_profile_quality.md) first detects rare
 catastrophic raw timing spikes per group/stage/phase using median/MAD and ratio
-tests. It records exclusions without modifying raw data, then checks cleaned CV,
-comparable cross-group shifts and fit residuals. Isolated spikes do not trigger
+tests. Heterogeneous calibration also detects isolated high or low group estimates
+against an exact-range/composition majority, requiring at least three survivors.
+It refits costs from accepted group medians without modifying original data,
+then checks accepted-group CV, cross-group shifts and fit residuals. Isolated anomalies do not trigger
 retry; frequent/consecutive spikes or failed quality checks trigger one complete
 recollection in fresh processes. Both attempts remain available, and a second
-failure stops automatic solver use. Quality-v2 diagnostics include raw/cleaned
-statistics and every rejected sample; policy changes invalidate calibration
+failure stops automatic solver use. Quality-v3 diagnostics include raw/cleaned
+sample/group statistics and every rejection; policy changes invalidate calibration
 receipts. Legacy profiles are not newly validated merely because they parse.
 
 Use the OR-enabled environment to export an evaluator-validated plan. The mounted

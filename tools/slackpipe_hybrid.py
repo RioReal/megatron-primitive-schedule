@@ -220,6 +220,7 @@ def main():
             payload = build_heterogeneous_cost_profile(
                 model_manifest=manifest,
                 observed_stage_rows=json.loads(args.observations.read_text()),
+                quality_thresholds=thresholds_from_args(args),
                 model_config=manifest["model_config"],
                 parallel_config={
                     "pp": args.calibration_pp,

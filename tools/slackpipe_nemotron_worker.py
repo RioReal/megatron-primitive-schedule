@@ -546,6 +546,7 @@ def main() -> None:
             profile = build_heterogeneous_cost_profile(
                 model_manifest=manifest,
                 observed_stage_rows=observed,
+                quality_thresholds=thresholds_from_args(args),
                 model_config={
                     **manifest["model_config"],
                     "dtype": args.precision,

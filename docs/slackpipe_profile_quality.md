@@ -32,6 +32,51 @@ in `(global iteration, microbatch)` order, including iteration boundaries.
 Cleaned CV, cross-group consistency and fit error must also pass unchanged.
 Isolated spikes alone do not cause a retry or `ProfilingQualityError`.
 
+## Repeated Calibration Groups
+
+The heterogeneous (cost-profile v2) builder now performs a second, **phase-local**
+analysis before fitting. Comparable observations require the same logical stage,
+exact contiguous range, stage role, worker, measurement context, manifest hash,
+ordered layer composition and, when recorded, class counts. The manifest supplies
+the composition; supplied composition/counts inconsistent with it are rejected.
+The context already binds model/hardware/software/timing configuration. Merely
+sharing a numeric stage index is not sufficient. Different ranges or Mamba,
+Attention and FFN compositions never vote in the same comparison.
+
+Each distinct calibration-group ID supplies one estimate (median if duplicate
+rows exist). For group estimates `x`, compute median `m` and
+`sigma = 1.4826 * median(abs(x - m))`. A **two-sided** candidate must satisfy both
+`abs(x - m) > K_group * sigma` and `abs(x - m) > D_group * m`.
+The detector is applied once to all original groups, not iterated until a tight
+cluster appears. It treats high and low anomalies symmetrically.
+
+Candidates are excluded only if at least three groups and a strict majority
+remain, the excluded fraction is at most 40%, and the proposed survivors have
+`max / min - 1 <= 0.10`. Otherwise no group is excluded and the consensus gate
+fails. Two equally plausible clusters or broadly dispersed groups are not
+arbitrarily pruned: the unchanged cross-group check can still reject them.
+Single-partition observations remain usable under the ordinary sample checks;
+they provide no evidence of repeat-group robustness and cannot authorize group
+exclusion. The homogeneous v1 collector still measures a single partition.
+
+For each comparable set and phase, the fitter consumes **one median of accepted
+group estimates**, with explicit source-row indices. This intentionally gives
+repeats one consensus vote instead of weighting an exact range by how many
+partitions happened to repeat it. The class/role least-squares fitter itself is
+unchanged. Forward and backward use separate accepted sets; rejecting backward
+does not remove valid forward measurements. Prefix costs and role biases are
+refitted from this data, not merely relabeled as passing. Every original stage
+row and its diagnostics remain in `observed_stages`.
+
+Within-group CV is still checked at 10% for **every accepted group**, never on
+averaged timestamps. CV alone cannot trigger group exclusion. Sample-level
+frequency/run-length guards and missing-provenance checks apply even to excluded
+groups. Fit RMSE is checked against all accepted original observations, not just
+the median fit inputs. Thus a majority with noisy accepted measurements still
+fails, even if its group medians are close. Old profiles without group selection
+metadata retain the strict all-observation checks; a receipt alone never removes
+previously fitted data.
+
 ## Empirical Checks
 
 All limits are configurable heuristics, not theoretical guarantees:
@@ -48,6 +93,11 @@ All limits are configurable heuristics, not theoretical guarantees:
 | `--quality-max-outlier-fraction` | 0.02 | Reject when discarded / raw sample count exceeds this fraction. |
 | `--quality-max-outlier-iteration-fraction` | 0.20 | Reject when iterations with any rejected sample / all measured iterations exceeds this fraction. |
 | `--quality-max-consecutive-outliers` | 1 | Reject when the longest consecutive rejected-sample run exceeds this count. |
+| `--quality-group-mad-multiplier` | 3 | K_group, applied to absolute deviation from the group median. |
+| `--quality-group-relative-deviation` | 0.15 | D_group, simultaneous relative-deviation floor. |
+| `--quality-group-min-survivors` | 3 | Minimum accepted distinct group IDs for any exclusion; cannot be below three. |
+| `--quality-group-max-discarded-fraction` | 0.40 | Maximum excluded groups / original comparable groups; must remain below 0.5. |
+| `--quality-group-consensus-median-shift` | 0.10 | Maximum proposed survivor max/min minus one to authorize exclusion, separate from the unchanged 0.30 final consistency limit. |
 
 Cross-group comparisons require at least two groups with identical contiguous
 layer ranges, stage roles, physical workers, and measurement-context hashes.
@@ -83,7 +133,7 @@ attempt0/worker/
 attempt1/worker/                    # created only after a quality failure
 ```
 
-The quality receipt is `slackpipe.profile_quality.v2`. Its status is `passed` or
+The quality receipt is `slackpipe.profile_quality.v3`. Its status is `passed` or
 `rerun_required`; issues carry rule, threshold, value, phase, group, stage, layer
 range, worker, observed costs, context hash and original data path. Profiles embed
 the receipt and are rehashed. The attempt ledger identifies the only selected
@@ -106,8 +156,8 @@ iteration. Quality policy changes require reaggregation, not simply reapproving
 previously filtered observations. All policy flags and the quality schema enter
 the generic calibration context/hash; downstream receipts are invalidated when
 they change. The existing receipt/context-v2 schema is unchanged. Legacy quality
-v1 profiles can still be explicitly validated under their stored policy but are
-not silently reused in a new v2 calibration context. Reports from old aggregated
+v1/v2 profiles can still be explicitly validated under their stored policy but are
+not silently reused in a new v3 calibration context. Reports from old aggregated
 rows mark `raw_sample_status=unavailable_or_partial_legacy_aggregation`; zero
 reported discards there does not certify that original raw samples were checked.
 
@@ -116,6 +166,32 @@ give 240 raw / 239 accepted / 1 discarded (0.4167%) for that stage/phase.
 Raw iteration CV is about 0.679 and cleaned CV is zero; stage cost remains
 10 ms. The profile passes without retry and can continue to solver/benchmark.
 This is a regression fixture, not an 8B GPU result.
+
+`group_filter` records the policy, comparable-set `comparisons`, phase-local
+`accepted_row_indices`, and exact `fit_observations`. `rejected_groups` records
+group ID, stage/phase/range/composition/context/worker, original estimate,
+consensus median, original median/MAD/sigma, absolute threshold, reason and raw
+data paths. Counts `raw_group_count`, `accepted_group_count`,
+`rejected_group_count`, `group_discarded_fraction` count **stage/phase group
+estimates**, not unique whole partition runs. Every comparison contains raw and
+cleaned CV **across group estimates**, raw/cleaned median shift and consensus
+cost in ms. These are separate from iteration CV in `sample_groups`.
+
+Sample counts retain their level-1 meaning. `group_excluded_sample_count` counts
+level-1 accepted samples excluded at level 2; `effective_accepted_sample_count`
+counts samples supporting accepted groups. A sample is not counted as rejected
+twice. Every sample-group report also marks `included_in_group_consensus`.
+Revalidation recomputes selection and fit inputs, checks the stored policy and
+row lineage, and applies the original fit-residual test to the actual prefix/
+role model. Changing a threshold or mask requires rebuilding the profile.
+
+Synthetic backward example `[19, 19.2, 18.9, 19.1, 13.5]` excludes only 13.5,
+retains four groups and uses their 19.05 ms median as the fit observation.
+`[19, 19.2, 18.9, 13.5, 13.8]` retains a strict 3/5 majority under defaults.
+`[14, 16, 18, 20, 22]` and `[14, 14.2, 20, 20.1]` fail without invented consensus.
+The reported `[19.053, 18.799, 20.045, 13.755, 15.995]` is not promised to pass:
+the broad original MAD can prevent exclusion, and accepted-group CV failures
+remain blockers. These heuristics are not a guarantee of physical contamination.
 
 Example warning (synthetic illustration, not a new GPU result):
 
@@ -179,11 +255,58 @@ Without the failing run's raw traces, the reported 280-360 ms spikes cannot be
 attributed to those mechanisms or ruled out as GPU/system stalls. Timing
 boundaries and profiler functionality are unchanged.
 
+For backward, the measured closure is `backward_step`; pipeline input/gradient
+preprocessing and post-step gradient-sync bookkeeping are outside that closure.
+The calibration configuration disables P2P overlap and does not enable activation
+recomputation. Each partition is rebuilt and independently warmed up with full
+steps; cache clearing occurs between partitions, not between timed stage calls.
+Per-partition allocator/state/clock effects may still change backward costs.
+Without raw traces we cannot correlate the reported group deviations with those
+effects, pipeline fill/drain, or communication. No timing-boundary change is
+justified by the currently available evidence.
+
+The supplied Nemotron-H 4B attempt-ledger path was absent from both this checkout's
+host and `slackpipe-dev` during the 2026-10-01 validation. The two 6 GiB A2000 GPUs
+cannot validate the full target here. Synthetic regression cases are explicitly
+separate from a rerun or a reanalysis of that historical calibration.
+
 Regression checks (existing container, no 8B model allocation):
 
 ```bash
 docker exec -w /workspace/Megatron-LM slackpipe-dev /opt/venv/bin/python -m pytest \
   tests/unit_tests/pipeline_parallel/test_slackpipe_outliers.py \
+  tests/unit_tests/pipeline_parallel/test_slackpipe_group_quality.py \
   tests/unit_tests/pipeline_parallel/test_slackpipe_profile_quality.py \
   tests/unit_tests/pipeline_parallel/test_slackpipe_eval_receipts.py -q
 ```
+
+## Validation Scope (2026-10-01)
+
+- Main regression suite: 217 passed; collection suite: 11 passed. Four PP=2
+  numerical-equivalence tests passed separately, covering homogeneous,
+  heterogeneous and hybrid models. FP32 differences were zero; BF16 used the
+  existing tolerances. Two PP=4 tests remain unexecuted on the two-GPU machine.
+- Synthetic two-level/campaign tests verify that accepted consensus reaches the
+  real C++ exporter and the mocked benchmark orchestration without retry;
+  broad/ambiguous/noisy survivors stop after at most one retry. The runtime
+  solver-to-PP=2 smoke uses an abstract-cost plan, not a rejected measured profile.
+- A tiny hybrid FP32 calibration ran at PP=2, N=4, B=8, sequence length 32,
+  20 warmup and 10 measured iterations per partition. Both attempts had 3840
+  raw samples, zero sample exclusions, and respectively two and three group
+  exclusions. Remaining quality failures correctly withheld the default profile.
+  Accepted-original-observation forward/backward relative RMSE was 38.86%/29.98%
+  initially and 37.02%/31.46% on retry, still above the unchanged 15% limit.
+  No solver/benchmark was authorized by these measurements. Their cause is not
+  established; this is not a successful measured-cost calibration or a 4B rerun.
+- Local diagnostics are retained under the ignored directory
+  `slackpipe_experiments/group_quality_20261001_fixed/calibration/`, including
+  both attempts and `profiling_attempts.json` (`selected_profile: null`). All
+  partitions/attempts in this validation share one source-diff hash. An earlier
+  development-time collection under `group_quality_20261001/calibration/` was
+  invalidated by concurrent source edits and blocked by the context guard; it
+  remains separate and is not counted as a validation success.
+
+The actual Nemotron-H 4B raw events and affected-stage consensus costs cannot be
+reported without the missing ledger/data. The two supplied raw spike values and
+the supplied group-estimate patterns are covered by explicitly synthetic tests,
+not presented as analysis of those unavailable files.

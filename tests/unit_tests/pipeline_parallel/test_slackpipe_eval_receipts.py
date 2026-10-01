@@ -206,6 +206,23 @@ def test_exact_standalone_three_campaign_one_reproduction(tmp_path, synthetic):
             {"calibrate", "solve", "smoke", "benchmark", "trace"},
         ),
         ("quality_min_outlier_samples", 30, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
+        ("quality_group_mad_multiplier", 4, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
+        (
+            "quality_group_relative_deviation",
+            0.2,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
+        (
+            "quality_group_max_discarded_fraction",
+            0.3,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
+        ("quality_group_min_survivors", 4, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
+        (
+            "quality_group_consensus_median_shift",
+            0.05,
+            {"calibrate", "solve", "smoke", "benchmark", "trace"},
+        ),
         ("solver_seconds", 600, {"solve", "smoke", "benchmark", "trace"}),
         ("profiler_active", 4, {"trace"}),
         ("trace_warmups", 9, {"trace"}),
@@ -222,12 +239,14 @@ def test_stage_invalidation(tmp_path, synthetic, field, value, changed):
 
 
 @pytest.mark.parametrize("systemic", [False, True])
-def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, systemic):
+@pytest.mark.parametrize("group_level", [False, True])
+def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, systemic, group_level):
     from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
         ProfilingQualityError,
         publish_profile,
         thresholds_from_args,
     )
+    from tests.unit_tests.pipeline_parallel.test_slackpipe_group_quality import group_profile
     from tests.unit_tests.pipeline_parallel.test_slackpipe_outliers import raw_profile
 
     original = Experiment._worker
@@ -248,8 +267,15 @@ def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, syst
         if systemic:
             spikes.append((4, "forward", 14, 356))
         thresholds = thresholds_from_args(self.args)
-        profile, events = raw_profile(directory, spikes, thresholds=thresholds)
-        write_json(directory / "raw.json", events)
+        if group_level:
+            profile = group_profile(
+                directory,
+                [14, 16, 18, 20, 22] if systemic else [19, 19.2, 18.9, 19.1, 13.5],
+                thresholds=thresholds,
+            )
+        else:
+            profile, events = raw_profile(directory, spikes, thresholds=thresholds)
+            write_json(directory / "raw.json", events)
         profile["model_config"] = dict(
             model_config_hash=fingerprint(self.model),
             dtype=self.args.precision,
@@ -275,7 +301,10 @@ def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, syst
         assert synthetic["solve"] == 1
         assert synthetic["slackpipe.benchmark"] == exp.args.repetitions
         profile = json.loads((tmp_path / exp.completed["calibrate"]["profile"]).read_text())
-        assert profile["quality"]["samples_discarded"] == 4
+        if group_level:
+            assert profile["quality"]["rejected_group_count"] == 1
+        else:
+            assert profile["quality"]["samples_discarded"] == 4
 
 
 @pytest.mark.parametrize("schedule", ["1f1b", "interleaved"])

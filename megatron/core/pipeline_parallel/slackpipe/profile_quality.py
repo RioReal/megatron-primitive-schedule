@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MESSAGE = "Profiling measurements are inconsistent. Rerun profiling before using this cost model."
-QUALITY_SCHEMA = "slackpipe.profile_quality.v2"
+QUALITY_SCHEMA = "slackpipe.profile_quality.v3"
 OUTLIER_POLICY_VERSION = 1
 
 
@@ -37,6 +37,11 @@ class QualityThresholds:
     max_outlier_iteration_fraction: float = 0.20
     max_consecutive_outliers: int = 1
     min_outlier_samples: int = 20
+    group_mad_multiplier: float = 3.0
+    group_relative_deviation: float = 0.15
+    group_max_discarded_fraction: float = 0.40
+    group_min_survivors: int = 3
+    group_consensus_median_shift: float = 0.10
 
     def __post_init__(self):
         if any(
@@ -59,6 +64,205 @@ class QualityThresholds:
             raise ValueError("max_consecutive_outliers must be a positive integer")
         if type(self.min_outlier_samples) is not int or self.min_outlier_samples < 3:
             raise ValueError("min_outlier_samples must be at least three")
+        if any(
+            not math.isfinite(v) or v <= 0
+            for v in (
+                self.group_mad_multiplier,
+                self.group_relative_deviation,
+                self.group_consensus_median_shift,
+            )
+        ):
+            raise ValueError("Group thresholds must be positive finite numbers")
+        if (
+            not math.isfinite(self.group_max_discarded_fraction)
+            or not 0 <= self.group_max_discarded_fraction < 0.5
+        ):
+            raise ValueError("Group discarded fraction must be in [0, 0.5)")
+        if type(self.group_min_survivors) is not int or self.group_min_survivors < 3:
+            raise ValueError("Group consensus requires at least three survivors")
+
+
+def comparable_group_key(row: dict) -> str:
+    """Bind semantic stage, exact ordered composition, placement and timing context."""
+    return json.dumps(
+        {
+            k: row.get(k)
+            for k in (
+                "stage",
+                "stage_layer_range",
+                "stage_role",
+                "worker",
+                "measurement_context",
+                "model_manifest_hash",
+                "layer_composition",
+                "class_counts",
+            )
+        },
+        sort_keys=True,
+    )
+
+
+def group_consensus(rows: list, thresholds: QualityThresholds) -> dict:
+    """Select two-sided MAD outliers once, never iteratively peel off minorities.
+
+    Decisions are phase-local, require three survivors and a strict majority,
+    and do not use within-group CV to choose which groups to discard. The fitter
+    receives one median observation per comparable set. Original rows stay intact.
+    """
+    comparisons, rejected, fit_rows, accepted = [], [], {}, {}
+    for phase in ("forward", "backward"):
+        field = f"{phase}_ms_per_op"
+        buckets = defaultdict(list)
+        for index, row in enumerate(rows):
+            complete = all(
+                row.get(k) is not None
+                for k in (
+                    "stage",
+                    "stage_layer_range",
+                    "stage_role",
+                    "worker",
+                    "measurement_context",
+                    "calibration_group_id",
+                    "raw_data_path",
+                )
+            )
+            key = comparable_group_key(row) if complete else f"unverified-row-{index}"
+            buckets[key].append(index)
+        fit_rows[phase], accepted[phase] = [], []
+        for indices in buckets.values():
+            groups = defaultdict(list)
+            for i in indices:
+                groups[rows[i].get("calibration_group_id", f"row-{i}")].append(i)
+            estimates = {
+                g: statistics.median(rows[i][field] for i in members)
+                for g, members in groups.items()
+            }
+            values = list(estimates.values())
+            valid = all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in values)
+            median = statistics.median(values) if valid else None
+            mad = statistics.median(abs(v - median) for v in values) if valid else None
+            sigma = 1.4826 * mad if valid else None
+            threshold = (
+                max(
+                    thresholds.group_mad_multiplier * sigma,
+                    thresholds.group_relative_deviation * median,
+                )
+                if valid
+                else None
+            )
+            candidates = (
+                [g for g, v in estimates.items() if abs(v - median) > threshold] if valid else []
+            )
+            survivors = [g for g in groups if g not in candidates]
+            remaining = [estimates[g] for g in survivors]
+            permitted = bool(candidates) and (
+                len(survivors) >= thresholds.group_min_survivors
+                and 2 * len(survivors) > len(groups)
+                and len(candidates) / len(groups) <= thresholds.group_max_discarded_fraction
+                and max(remaining) / min(remaining) - 1 <= thresholds.group_consensus_median_shift
+            )
+            excluded = candidates if permitted else []
+            kept = [
+                i
+                for i in indices
+                if rows[i].get("calibration_group_id", f"row-{i}") not in excluded
+            ]
+            clean = [v for g, v in estimates.items() if g not in excluded]
+            consensus = statistics.median(clean) if valid else None
+            first = rows[indices[0]]
+            identity = {
+                k: first.get(k)
+                for k in (
+                    "stage",
+                    "stage_layer_range",
+                    "stage_role",
+                    "worker",
+                    "measurement_context",
+                    "model_manifest_hash",
+                    "layer_composition",
+                    "class_counts",
+                )
+            }
+
+            def cv(samples):
+                return statistics.pstdev(samples) / statistics.fmean(samples) if valid else None
+
+            summary = dict(
+                **identity,
+                phase=phase,
+                raw_group_count=len(groups),
+                accepted_group_count=len(clean),
+                rejected_group_count=len(excluded),
+                group_discarded_fraction=len(excluded) / len(groups),
+                raw_cv=cv(values),
+                cleaned_cv=cv(clean),
+                raw_median_shift=max(values) / min(values) - 1 if valid else None,
+                cleaned_median_shift=max(clean) / min(clean) - 1 if valid else None,
+                median_ms=median,
+                MAD=mad,
+                robust_sigma=sigma,
+                threshold_ms=threshold,
+                consensus_median_ms=consensus,
+                candidate_groups=candidates,
+                accepted_groups=[g for g in groups if g not in excluded],
+                estimates_ms=estimates,
+                status=(
+                    "invalid_estimates"
+                    if not valid
+                    else (
+                        "no_consensus"
+                        if candidates and not permitted
+                        else "filtered" if excluded else "unchanged"
+                    )
+                ),
+            )
+            comparisons.append(summary)
+            for g in excluded:
+                rejected.append(
+                    dict(
+                        **identity,
+                        calibration_group_id=g,
+                        phase=phase,
+                        estimate_ms=estimates[g],
+                        consensus_median_ms=consensus,
+                        median_ms=median,
+                        MAD=mad,
+                        robust_sigma=sigma,
+                        threshold_ms=threshold,
+                        rejection_reason="two_sided_MAD_and_relative_deviation_with_strict_majority",
+                        raw_data_paths=[rows[i].get("raw_data_path") for i in groups[g]],
+                        source_row_indices=groups[g],
+                    )
+                )
+            # One consensus observation preserves stage semantics without allowing
+            # duplicate group rows to vote multiple times or bias the least-squares fit.
+            observation = dict(identity)
+            observation.update({k: first[k] for k in ("begin", "end", "layer_count") if k in first})
+            observation.update(
+                {
+                    field: consensus if valid else first[field],
+                    "source_row_indices": kept,
+                    "calibration_group_ids": [g for g in groups if g not in excluded],
+                }
+            )
+            fit_rows[phase].append(observation)
+            accepted[phase].extend(kept)
+    return dict(
+        policy=dict(
+            policy_version=1,
+            **{k: v for k, v in asdict(thresholds).items() if k.startswith("group_")},
+        ),
+        comparisons=comparisons,
+        rejected_groups=rejected,
+        raw_group_count=sum(g["raw_group_count"] for g in comparisons),
+        accepted_group_count=sum(g["accepted_group_count"] for g in comparisons),
+        rejected_group_count=len(rejected),
+        group_discarded_fraction=(
+            len(rejected) / sum(g["raw_group_count"] for g in comparisons) if comparisons else 0.0
+        ),
+        accepted_row_indices=accepted,
+        fit_observations=fit_rows,
+    )
 
 
 def outlier_policy(thresholds: QualityThresholds) -> dict:
@@ -238,10 +442,45 @@ def assess_profile(profile: dict, thresholds: QualityThresholds = QualityThresho
 
     if not rows:
         record("missing_measurements", 0, 1, [], "both", True)
+    consensus = None
+    if (
+        profile.get("measurement_definition", {}).get("group_estimator")
+        and "group_filter" not in profile
+    ):
+        record(
+            "missing_group_analysis",
+            None,
+            "group selection and fit provenance required",
+            rows,
+            "both",
+            True,
+        )
+    if "group_filter" in profile:
+        consensus = group_consensus(rows, thresholds)
+        record(
+            "group_consensus_provenance",
+            profile["group_filter"] == consensus,
+            True,
+            rows,
+            "both",
+            profile["group_filter"] != consensus,
+        )
+        for comparison in consensus["comparisons"]:
+            record(
+                "group_consensus",
+                comparison["status"],
+                "stable strict majority",
+                [r for r in rows if comparable_group_key(r) == comparable_group_key(comparison)],
+                comparison["phase"],
+                comparison["status"] in ("no_consensus", "invalid_estimates"),
+            )
     for phase in ("forward", "backward"):
         comparable = defaultdict(list)
         observed, predicted = [], []
-        for row in rows:
+        accepted_indices = (
+            set(consensus["accepted_row_indices"][phase]) if consensus else set(range(len(rows)))
+        )
+        for index, row in enumerate(rows):
             diagnostics = row.get(f"{phase}_diagnostics", {})
             filtering = diagnostics.get("outlier_filter")
             if filtering is None and profile.get("measurement_definition", {}).get("filtering"):
@@ -294,6 +533,7 @@ def assess_profile(profile: dict, thresholds: QualityThresholds = QualityThresho
                         **filtering,
                         raw_cv=diagnostics.get("raw_cv"),
                         cleaned_cv=diagnostics.get("cv"),
+                        included_in_group_consensus=index in accepted_indices,
                     )
                 )
             provenance = all(
@@ -322,17 +562,22 @@ def assess_profile(profile: dict, thresholds: QualityThresholds = QualityThresho
                 )
                 continue
             cv = statistics.pstdev(samples) / statistics.fmean(samples)
-            record("within_group_cv", cv, thresholds.cv, [row], phase, cv > thresholds.cv)
+            record(
+                "within_group_cv",
+                cv,
+                thresholds.cv,
+                [row],
+                phase,
+                cv > thresholds.cv and index in accepted_indices,
+            )
+            metrics[-1]["included_in_group_consensus"] = index in accepted_indices
             value = row.get(f"{phase}_ms_per_op")
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 record("invalid_operation_cost", None, None, [row], phase, True)
                 continue
-            key = (
-                tuple(row["stage_layer_range"]),
-                row["stage_role"],
-                row["worker"],
-                row["measurement_context"],
-            )
+            if index not in accepted_indices:
+                continue
+            key = comparable_group_key(row)
             comparable[key].append(row)
             if profile.get("schema_version") == "slackpipe.cost_profile.v2":
                 begin, end = row["stage_layer_range"]
@@ -376,9 +621,12 @@ def assess_profile(profile: dict, thresholds: QualityThresholds = QualityThresho
                 "fit_relative_rmse",
                 rmse if math.isfinite(rmse) else None,
                 thresholds.relative_rmse,
-                rows,
+                [row for i, row in enumerate(rows) if i in accepted_indices],
                 phase,
                 not math.isfinite(rmse) or rmse > thresholds.relative_rmse,
+            )
+            metrics[-1]["observation_basis"] = (
+                "accepted_original_group_estimates" if consensus else "all_original_group_estimates"
             )
     return dict(
         schema_version=QUALITY_SCHEMA,
@@ -399,6 +647,20 @@ def assess_profile(profile: dict, thresholds: QualityThresholds = QualityThresho
         ),
         sample_groups=sample_groups,
         rejected_samples=[s for g in sample_groups for s in g["rejected_samples"]],
+        group_filter=consensus,
+        rejected_groups=consensus["rejected_groups"] if consensus else [],
+        raw_group_count=consensus["raw_group_count"] if consensus else None,
+        accepted_group_count=consensus["accepted_group_count"] if consensus else None,
+        rejected_group_count=consensus["rejected_group_count"] if consensus else None,
+        group_discarded_fraction=consensus["group_discarded_fraction"] if consensus else None,
+        effective_accepted_sample_count=sum(
+            g["accepted_sample_count"] for g in sample_groups if g["included_in_group_consensus"]
+        ),
+        group_excluded_sample_count=sum(
+            g["accepted_sample_count"]
+            for g in sample_groups
+            if not g["included_in_group_consensus"]
+        ),
         raw_sample_status=(
             "available"
             if len(sample_groups) == 2 * len(rows) and rows
@@ -500,6 +762,7 @@ def require_profile_quality(profile: dict) -> None:
     quality = profile.get("quality", {})
     if quality.get("status") != "passed" or quality.get("quality_schema_version") not in (
         "slackpipe.profile_quality.v1",
+        "slackpipe.profile_quality.v2",
         QUALITY_SCHEMA,
     ):
         raise ProfilingQualityError(

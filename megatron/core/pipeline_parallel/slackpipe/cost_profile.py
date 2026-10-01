@@ -14,6 +14,7 @@ import numpy
 from megatron.core.pipeline_parallel.slackpipe.manifest import canonical_json
 from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
     QualityThresholds,
+    group_consensus,
     isolate_timing_spikes,
 )
 
@@ -419,18 +420,46 @@ def build_heterogeneous_cost_profile(
     model_config: Mapping[str, object],
     parallel_config: Mapping[str, object],
     units: str = "milliseconds",
+    quality_thresholds: QualityThresholds = QualityThresholds(),
 ) -> dict[str, object]:
     """Build slackpipe.cost_profile.v2 from stage-level heterogeneous samples."""
 
     if units != "milliseconds":
         raise ValueError("only millisecond input samples are currently supported")
+    layer_classes = _layer_classes(model_manifest)
+    observations = []
+    for row in observed_stage_rows:
+        begin, end = _stage_range(row)
+        composition = layer_classes[begin:end]
+        expected_counts = {c: composition.count(c) for c in set(composition)}
+        if (
+            ("layer_composition" in row and row["layer_composition"] != composition)
+            or ("class_counts" in row and row["class_counts"] != expected_counts)
+            or (
+                "model_manifest_hash" in row
+                and row["model_manifest_hash"] != model_manifest.get("manifest_hash")
+            )
+        ):
+            raise ValueError("Observed layer composition differs from the model manifest")
+        observations.append(
+            dict(
+                row,
+                stage_layer_range=[begin, end],
+                layer_composition=composition,
+                model_manifest_hash=model_manifest.get("manifest_hash"),
+            )
+        )
+    consensus = group_consensus(observations, quality_thresholds)
     forward_fit = fit_heterogeneous_class_costs(
-        observed_stage_rows, model_manifest=model_manifest, value_field="forward_ms_per_op"
+        consensus["fit_observations"]["forward"],
+        model_manifest=model_manifest,
+        value_field="forward_ms_per_op",
     )
     backward_fit = fit_heterogeneous_class_costs(
-        observed_stage_rows, model_manifest=model_manifest, value_field="backward_ms_per_op"
+        consensus["fit_observations"]["backward"],
+        model_manifest=model_manifest,
+        value_field="backward_ms_per_op",
     )
-    layer_classes = _layer_classes(model_manifest)
     forward_ms = [forward_fit["class_costs"][class_id] for class_id in layer_classes]
     backward_ms = [backward_fit["class_costs"][class_id] for class_id in layer_classes]
     layer_costs_us = [
@@ -445,8 +474,12 @@ def build_heterogeneous_cost_profile(
     profile = {
         "schema_version": SLACKPIPE_COST_PROFILE_SCHEMA_VERSION_V2,
         "model_manifest_hash": model_manifest.get("manifest_hash"),
-        "measurement_definition": calibration_measurement_definition(),
-        "observed_stages": [dict(row) for row in observed_stage_rows],
+        "measurement_definition": {
+            **calibration_measurement_definition(),
+            "group_estimator": "one median of accepted comparable group estimates per phase; separate accepted sets; no raw rows overwritten",
+        },
+        "observed_stages": observations,
+        "group_filter": consensus,
         "model_config": dict(model_config),
         "parallel_config": dict(parallel_config),
         "class_costs_us": {
@@ -468,6 +501,7 @@ def build_heterogeneous_cost_profile(
         },
         "fit": {
             "forward": {
+                "observation_basis": "group_consensus_medians",
                 "rank": forward_fit["rank"],
                 "condition": forward_fit["condition"],
                 "rmse": forward_fit["rmse"],
@@ -476,6 +510,7 @@ def build_heterogeneous_cost_profile(
                 "relative_rmse": forward_fit["relative_rmse"],
             },
             "backward": {
+                "observation_basis": "group_consensus_medians",
                 "rank": backward_fit["rank"],
                 "condition": backward_fit["condition"],
                 "rmse": backward_fit["rmse"],
