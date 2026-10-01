@@ -5,9 +5,18 @@ import argparse
 import json
 import shutil
 import subprocess
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
+from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
+    ESTIMATOR,
+    failure_summary,
+    quality_report,
+)
+from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
+    require_quality as require_isolated_quality,
+)
 from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
     MESSAGE,
     ProfilingQualityError,
@@ -15,8 +24,32 @@ from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
 )
 
 
+def _isolated_attempt(candidate: dict, report: dict, configuration: dict, worker: Path):
+    """Validate isolated data directly, not through the pipeline quality evaluator."""
+    evaluated = quality_report(candidate, raw_data_path=str(worker / "isolated_profile_raw.json"))
+    for key in ("quality_schema_version", "thresholds", "status", "issues"):
+        if report.get(key) != evaluated[key]:
+            raise ProfilingQualityError(f"Isolated quality receipt differs from raw data: {key}")
+    policy = configuration.get("policy", {})
+    context = candidate["isolated"]["context"]
+    for key, value in (
+        ("model_manifest_hash", candidate["model_manifest_hash"]),
+        ("warmups", context["warmups"]),
+        ("iterations", context["iterations"]),
+        ("quality", context["policy"]),
+        ("execution", context["execution"]),
+        ("statistic", context.get("statistic", "median")),
+        ("quality_schema", evaluated["quality_schema_version"]),
+        ("class_signatures", [c["class_signature"] for c in candidate["isolated"]["classes"]]),
+    ):
+        if key in policy and policy[key] != value:
+            raise ProfilingQualityError(f"Isolated receipt/collector {key} mismatch")
+    identity = [ESTIMATOR, json.dumps(context, sort_keys=True)]
+    return evaluated, identity
+
+
 def collect_with_retry(directory: Path, collect, configuration: dict) -> Path:
-    """Run at most two complete, independently stored collection subprocesses."""
+    """Estimator-neutral retry runner; quality semantics are dispatched explicitly."""
     attempts = []
     reference = None
     summary = dict(
@@ -53,52 +86,33 @@ def collect_with_retry(directory: Path, collect, configuration: dict) -> Path:
                 )
                 raise
         report = json.loads((worker / "cost_profile.quality.json").read_text())
+        candidate = json.loads((worker / "cost_profile.candidate.json").read_text())
+        expected_estimator = configuration.get("policy", {}).get("estimator")
+        isolated = candidate.get("estimator") == ESTIMATOR
+        if expected_estimator == ESTIMATOR and not isolated:
+            raise ProfilingQualityError("Collector returned a different calibration estimator")
+        if isolated:
+            report, identity = _isolated_attempt(candidate, report, configuration, worker)
+        else:
+            identity = sorted(
+                json.dumps(
+                    {
+                        k: row.get(k)
+                        for k in (
+                            "calibration_group_id",
+                            "stage",
+                            "worker",
+                            "stage_layer_range",
+                            "measurement_context",
+                        )
+                    },
+                    sort_keys=True,
+                )
+                for row in candidate.get("observed_stages", [])
+            )
         entry.update(
             ended_at=datetime.now(timezone.utc).isoformat(), quality=report, status=report["status"]
         )
-        candidate = json.loads((worker / "cost_profile.candidate.json").read_text())
-        expected_estimator = configuration.get("policy", {}).get("estimator")
-        if (
-            expected_estimator == "isolated-layer-compute-v1"
-            and candidate.get("estimator") != expected_estimator
-        ):
-            raise ProfilingQualityError("Collector returned a different calibration estimator")
-        if expected_estimator == "isolated-layer-compute-v1":
-            policy = configuration["policy"]
-            context = candidate["isolated"]["context"]
-            for key, value in (
-                ("model_manifest_hash", candidate["model_manifest_hash"]),
-                ("warmups", context["warmups"]),
-                ("iterations", context["iterations"]),
-                ("quality", context["policy"]),
-                ("execution", context["execution"]),
-                ("statistic", context.get("statistic", "median")),
-                ("quality_schema", candidate["quality"]["quality_schema_version"]),
-                (
-                    "class_signatures",
-                    [c["class_signature"] for c in candidate["isolated"]["classes"]],
-                ),
-            ):
-                if key in policy and policy[key] != value:
-                    raise ProfilingQualityError(f"Isolated receipt/collector {key} mismatch")
-        identity = sorted(
-            json.dumps(
-                {
-                    k: row.get(k)
-                    for k in (
-                        "calibration_group_id",
-                        "stage",
-                        "worker",
-                        "stage_layer_range",
-                        "measurement_context",
-                    )
-                },
-                sort_keys=True,
-            )
-            for row in candidate.get("observed_stages", [])
-        )
-        if candidate.get("estimator") == "isolated-layer-compute-v1":
-            identity.append(json.dumps(candidate["isolated"]["context"], sort_keys=True))
         identity.append(json.dumps(report["thresholds"], sort_keys=True))
         if reference is None:
             reference = identity
@@ -113,15 +127,28 @@ def collect_with_retry(directory: Path, collect, configuration: dict) -> Path:
             )
         profile = worker / "cost_profile.json"
         if report["status"] == "passed":
-            require_profile_quality(json.loads(profile.read_text()))
+            selected = json.loads(profile.read_text())
+            if isolated:
+                require_isolated_quality(selected)
+                if selected["cost_profile_hash"] != candidate["cost_profile_hash"]:
+                    raise ProfilingQualityError("Selected isolated profile differs from candidate")
+            else:
+                require_profile_quality(selected)
             summary.update(status="passed", selected_profile=str(profile))
         else:
             summary["status"] = "rerun_required"
         (directory / "profiling_attempts.json").write_text(json.dumps(summary, indent=2) + "\n")
         if summary["status"] == "passed":
             return profile
+        if isolated:
+            warnings.warn(f"{MESSAGE} attempt={attempt} {failure_summary(report)}", RuntimeWarning)
+    details = " ".join(
+        f"attempt={entry['attempt']} {failure_summary(entry['quality'])}"
+        for entry in attempts
+        if entry["quality"].get("estimator") == ESTIMATOR
+    )
     raise ProfilingQualityError(
-        f"{MESSAGE} Automatic retry exhausted. See {directory / 'profiling_attempts.json'}"
+        f"{MESSAGE} Automatic retry exhausted. {details} See {directory / 'profiling_attempts.json'}"
     )
 
 

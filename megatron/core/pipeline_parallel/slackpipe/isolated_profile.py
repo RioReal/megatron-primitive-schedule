@@ -206,7 +206,7 @@ def build_profile(
     return profile
 
 
-def require_quality(profile: dict) -> None:
+def require_quality(profile: dict, *, allow_unstable: bool = False) -> None:
     """Recompute selection and expansion, rather than trusting a 'passed' flag."""
     from .profile_quality import MESSAGE, ProfilingQualityError
 
@@ -252,10 +252,94 @@ def require_quality(profile: dict) -> None:
         ):
             if rebuilt[key] != profile[key]:
                 raise ValueError(f"Invalid isolated {key}")
-        if rebuilt["quality"]["status"] != "passed":
+        if not allow_unstable and rebuilt["quality"]["status"] != "passed":
             raise ValueError("Unstable isolated measurements")
     except (KeyError, TypeError, ValueError) as e:
         raise ProfilingQualityError(f"{MESSAGE} {e}") from e
+
+
+def quality_report(profile: dict, *, raw_data_path: str = "") -> dict:
+    """Explain isolated acceptance from validated raw samples, including failed candidates.
+
+    This is an additive sidecar report; existing profile hashes and quality policy
+    remain unchanged. No stage/partition/group evaluator participates.
+    """
+    require_quality(profile, allow_unstable=True)
+    data = profile["isolated"]
+    policy = IsolatedPolicy(**profile["quality"]["thresholds"])
+    classes = {c["class_signature"]: c for c in data["classes"]}
+    units = []
+    for unit in data["units"]:
+        key = unit["class_signature"]
+        info = classes.get(key, {})
+        result = dict(
+            class_signature=key,
+            layer_type=info.get("layer_type", unit.get("layer_type", key)),
+            member_layer_indices=info.get("member_layers", []),
+            representative_layer=info.get("representative_layer"),
+            signature=info.get("signature"),
+            executed=unit.get("executed"),
+        )
+        for phase in ("forward", "backward"):
+            s = data["summaries"][key][phase]
+            raw = unit[phase + "_gpu_ms"]
+            excluded = s["excluded_indices"]
+            fraction = len(excluded) / len(raw)
+            max_fraction = policy.max_excluded / policy.min_samples_for_exclusion
+            rules = []
+            if s["accepted"]["count"] < policy.min_samples:
+                rules.append("isolated_sample_count")
+            if fraction > max_fraction:
+                rules.append("isolated_rejected_fraction")
+            if s["accepted"]["cv"] > policy.max_cv:
+                rules.append("isolated_cv")
+            result[phase] = dict(
+                **s["accepted"],
+                raw_statistics=s["raw"],
+                raw_samples_ms=raw,
+                accepted_samples_ms=[v for i, v in enumerate(raw) if i not in excluded],
+                raw_sample_count=len(raw),
+                accepted_sample_count=s["accepted"]["count"],
+                samples_discarded=len(excluded),
+                discarded_indices=excluded,
+                rejected_fraction=fraction,
+                max_rejected_fraction=max_fraction,
+                selected_ms=s["selected_ms"],
+                max_cv=policy.max_cv,
+                min_samples=policy.min_samples,
+                failed_rules=rules,
+                status="rerun_required" if rules else "passed",
+            )
+        result["status"] = (
+            "passed"
+            if all(result[p]["status"] == "passed" for p in ("forward", "backward"))
+            else "rerun_required"
+        )
+        units.append(result)
+    return dict(
+        profile["quality"],
+        estimator=ESTIMATOR,
+        sampling={k: data["context"][k] for k in ("warmups", "iterations")},
+        raw_data_path=raw_data_path,
+        units=units,
+    )
+
+
+def failure_summary(report: dict) -> str:
+    """Human-readable class/phase diagnosis; full raw samples remain in the report."""
+    failures = []
+    for unit in report["units"]:
+        for phase in ("forward", "backward"):
+            s = unit[phase]
+            if s["status"] != "passed":
+                failures.append(
+                    f"class={unit['layer_type']}:{unit['class_signature']} phase={phase} "
+                    f"rules={','.join(s['failed_rules'])} CV={s['cv']:.6g} limit={s['max_cv']} "
+                    f"accepted={s['accepted_sample_count']}/{s['raw_sample_count']} "
+                    f"discarded={s['samples_discarded']} mean_ms={s['mean_ms']:.6g} "
+                    f"median_ms={s['median_ms']:.6g} raw={report['raw_data_path']}"
+                )
+    return "; ".join(failures)
 
 
 def add_arguments(parser) -> None:

@@ -2,7 +2,6 @@
 """One-GPU isolated real-Megatron unit calibration. Never invokes a pipeline scheduler."""
 
 import gc
-import json
 import tempfile
 import time
 import warnings
@@ -31,6 +30,8 @@ from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
     build_profile,
     class_mapping,
     execution_signature,
+    failure_summary,
+    quality_report,
 )
 from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
 from megatron.core.pipeline_parallel.slackpipe.profile_quality import MESSAGE
@@ -212,6 +213,7 @@ def measure_unit(module, hidden, forward, *, warmups: int, iterations: int) -> d
             )
         del output
     return dict(
+        executed=dict(warmup_pairs=warmups, measured_pairs=len(rows), initialization_forwards=1),
         samples=rows,
         **{key: [r[key] for r in rows] for key in ("forward_gpu_ms", "backward_gpu_ms")},
         finite_outputs_and_gradients=True,
@@ -349,14 +351,17 @@ def collect(args) -> None:
                 ),
             )
             write_cost_profile(args.output / "cost_profile.candidate.json", profile)
+            report = quality_report(
+                profile, raw_data_path=str(args.output / "isolated_profile_raw.json")
+            )
             write_json(
                 args.output / "cost_profile.quality.json",
-                dict(profile["quality"], attempt=args.profiling_attempt),
+                dict(report, attempt=args.profiling_attempt),
             )
             if profile["quality"]["status"] == "passed":
                 write_cost_profile(args.output / "cost_profile.json", profile)
             else:
-                warnings.warn(f"{MESSAGE} {json.dumps(profile['quality']['issues'])}")
+                warnings.warn(f"{MESSAGE} {failure_summary(report)}")
                 raise SystemExit(2)
         finally:
             parallel_state.destroy_model_parallel()

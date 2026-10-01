@@ -289,19 +289,6 @@ class Experiment:
         if stage in ("smoke", "native-smoke"):
             policy = dict(warmups=args.smoke_warmups, iterations=args.smoke_iterations)
         elif stage == "calibrate":
-            policy = dict(
-                warmups=args.calibration_warmups,
-                iterations=args.calibration_iterations,
-                partitions=(
-                    "class-identifiable-v1"
-                    if self.model["model_family"] == "nemotron_h"
-                    else "uniform"
-                ),
-                estimator="existing-stage-wall-time-v1",
-                quality=asdict(thresholds_from_args(args)),
-                quality_schema="slackpipe.profile_quality.v3",
-                automatic_retry_limit=1,
-            )
             from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
                 ESTIMATOR,
                 IsolatedPolicy,
@@ -337,6 +324,20 @@ class Experiment:
                     ],
                 )
                 context["schedule"] = "isolated-no-pipeline"
+            else:
+                policy = dict(
+                    warmups=args.calibration_warmups,
+                    iterations=args.calibration_iterations,
+                    partitions=(
+                        "class-identifiable-v1"
+                        if self.model["model_family"] == "nemotron_h"
+                        else "uniform"
+                    ),
+                    estimator="existing-stage-wall-time-v1",
+                    quality=asdict(thresholds_from_args(args)),
+                    quality_schema="slackpipe.profile_quality.v3",
+                    automatic_retry_limit=1,
+                )
         elif stage == "solve":
             context.update(
                 solver_sha256=digest(args.solver) if args.solver.is_file() else None,
@@ -475,8 +476,6 @@ class Experiment:
             command += ["--plan", plan, "--profile", profile]
         if stage == "calibrate":
             command += ["--profiling-attempt", attempt]
-            for key, value in asdict(thresholds_from_args(args)).items():
-                command += [f"--quality-{key.replace('_', '-')}", value]
             command += ["--calibration-estimator", args.calibration_estimator]
             if args.calibration_estimator == "isolated-layer-compute-v1":
                 command = [
@@ -491,6 +490,9 @@ class Experiment:
                     "isolated_profile_max_cv",
                 ):
                     command += ["--" + name.replace("_", "-"), getattr(args, name)]
+            else:
+                for key, value in asdict(thresholds_from_args(args)).items():
+                    command += [f"--quality-{key.replace('_', '-')}", value]
         self._execute(command, directory.parent, directory.name)
 
     def ensure(self, stage):

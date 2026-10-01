@@ -71,6 +71,42 @@ The campaign/quality wrapper launches at most one complete retry in a fresh
 process, retaining both attempts. A second failure blocks automatic solver use.
 Direct collector invocation reports failure but does not itself retry.
 
+### Diagnosing a Rejected Attempt
+
+`collect_with_retry()` is a shared retry runner, not the legacy statistical
+evaluator. For isolated results it validates the candidate with the isolated
+validator directly. The pipeline evaluator (including group consensus and
+cross-group median shifts) is only used for legacy profiles. The campaign no
+longer constructs or forwards legacy `--quality-*` settings for isolated runs.
+`--quality-cv` is not mapped onto `--isolated-profile-max-cv`.
+
+Each `cost_profile.quality.json` and the corresponding entry in
+`profiling_attempts.json` now includes `estimator`, `sampling`, `raw_data_path`
+and `units`. A unit records class signature, layer type, member layer indices,
+representative layer and configuration signature. Independent `forward` and
+`backward` records contain raw/accepted samples, raw statistics, accepted
+mean/median/stddev/CV/min/max, counts, discarded indices/fraction, selected cost,
+failed rules and `passed`/`rerun_required` status. Boundary units are also checked.
+No pipeline group metrics are generated. The unchanged catastrophic policy
+allows at most one exclusion with >=30 raw samples, bounding the rejected
+fraction by 1/30. Every omitted sample remains in the raw arrays.
+
+Failure warnings and the final exhausted-retry exception identify the attempt,
+class, phase, rule, actual CV, limit and raw-data path. For example, a synthetic
+alternating 1/5 ms series produces `phase=backward rules=isolated_cv
+CV=0.666667 limit=0.15 accepted=30/30 discarded=0`. Do not interpret the generic
+`ProfilingQualityError` class or shared wrapper filename as evidence of pipeline
+quality leakage; inspect the actual receipt's estimator, schema and failed rules.
+
+The collector uses only isolated warmup/iteration flags. Compatibility
+`--warmups 5 --iterations 10` cannot override `--isolated-profile-warmups 20
+--isolated-profile-iterations 30`. Each raw unit records
+`executed: {warmup_pairs: 20, measured_pairs: 30, initialization_forwards: 1}`;
+the extra untimed forward prepares output shape/upstream gradient, and is not a
+measured sample or warmup pair. Global sample indices are 20 through 49.
+Schedule/PP/VPP/transport flags describe the target topology, not isolated runtime
+execution. No partition0/partition1 collections or interleaved runtime are used.
+
 ## Commands
 
 Run from the repository root with the existing `slackpipe-dev` container. Only
